@@ -48,7 +48,9 @@ Imports must appear before all items. The MVP parser rejects imports after funct
 
 Imports are syntax-only in v0.1.
 
-Duplicate imports are preserved as written and have no semantic effect yet.
+**Superseded by v0.4:** [RFC-0023](RFC-0023-v0-4-roadmap-and-scope.md) through [RFC-0030](RFC-0030-v0-4-diagnostics.md) define real module identity, import resolution, multi-file compilation, and `pub` visibility.
+
+Duplicate imports are preserved as written and have no semantic effect yet in v0.1–v0.3.
 
 Dotted paths, aliases, visibility, package roots, file discovery, and multi-file compilation are postponed.
 

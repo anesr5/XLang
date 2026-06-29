@@ -3,14 +3,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, ffi::OsString};
 
-use crate::ast::Program;
 use crate::backend::llvm;
 use crate::diagnostic::{Diagnostic, XResult};
-use crate::{lexer, parser, typeck};
+use crate::modules::CompilationUnit;
+use crate::typeck;
 
 #[derive(Debug, Clone)]
 pub struct CheckedProgram {
-    pub program: Program,
+    pub unit: CompilationUnit,
+}
+
+impl CheckedProgram {
+    pub fn program(&self) -> &crate::ast::Program {
+        &self.unit.entry_module().program
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,16 +33,15 @@ impl CompileOptions {
 }
 
 pub fn check(file: &Path) -> XResult<CheckedProgram> {
-    let source = fs::read_to_string(file)
-        .map_err(|err| Diagnostic::io(format!("failed to read source: {err}"), 1, 1))?;
-    check_source(&source)
+    let unit = CompilationUnit::load(file)?;
+    typeck::check_unit(&unit)?;
+    Ok(CheckedProgram { unit })
 }
 
 pub fn check_source(source: &str) -> XResult<CheckedProgram> {
-    let tokens = lexer::lex(source)?;
-    let program = parser::parse(tokens)?;
-    typeck::check(&program)?;
-    Ok(CheckedProgram { program })
+    let unit = CompilationUnit::from_source(source)?;
+    typeck::check_unit(&unit)?;
+    Ok(CheckedProgram { unit })
 }
 
 pub fn emit_llvm(file: &Path) -> XResult<String> {
@@ -45,7 +50,11 @@ pub fn emit_llvm(file: &Path) -> XResult<String> {
 
 pub fn emit_llvm_with_options(file: &Path, options: &CompileOptions) -> XResult<String> {
     let checked = check(file)?;
-    llvm::emit_llvm_ir_with_options(&checked.program, &llvm_options(options))
+    let mut modules = llvm::emit_compilation_unit(&checked.unit, &llvm_options(options))?;
+    let entry = checked.unit.entry.clone();
+    modules.remove(&entry).ok_or_else(|| {
+        Diagnostic::backend(format!("missing LLVM IR for entry module `{entry}`"), 1, 1)
+    })
 }
 
 pub fn emit_llvm_source(source: &str) -> XResult<String> {
@@ -54,7 +63,11 @@ pub fn emit_llvm_source(source: &str) -> XResult<String> {
 
 pub fn emit_llvm_source_with_options(source: &str, options: &CompileOptions) -> XResult<String> {
     let checked = check_source(source)?;
-    llvm::emit_llvm_ir_with_options(&checked.program, &llvm_options(options))
+    let mut modules = llvm::emit_compilation_unit(&checked.unit, &llvm_options(options))?;
+    let entry = checked.unit.entry.clone();
+    modules.remove(&entry).ok_or_else(|| {
+        Diagnostic::backend(format!("missing LLVM IR for entry module `{entry}`"), 1, 1)
+    })
 }
 
 pub fn build(file: &Path) -> XResult<PathBuf> {
@@ -62,13 +75,20 @@ pub fn build(file: &Path) -> XResult<PathBuf> {
 }
 
 pub fn build_with_options(file: &Path, options: &CompileOptions) -> XResult<PathBuf> {
-    let llvm_ir = emit_llvm_with_options(file, options)?;
+    let checked = check(file)?;
+    let modules = llvm::emit_compilation_unit(&checked.unit, &llvm_options(options))?;
     let build_dir = PathBuf::from("build");
     fs::create_dir_all(&build_dir)
         .map_err(|err| Diagnostic::io(format!("failed to create build directory: {err}"), 1, 1))?;
-    let ir_path = build_dir.join("main.ll");
-    fs::write(&ir_path, llvm_ir)
-        .map_err(|err| Diagnostic::io(format!("failed to write LLVM IR: {err}"), 1, 1))?;
+
+    let mut ir_paths = Vec::new();
+    for (module_name, ir) in &modules {
+        let ir_path = build_dir.join(format!("{module_name}.ll"));
+        fs::write(&ir_path, ir).map_err(|err| {
+            Diagnostic::io(format!("failed to write LLVM IR for `{module_name}`: {err}"), 1, 1)
+        })?;
+        ir_paths.push(ir_path);
+    }
 
     let executable = build_dir.join(if cfg!(windows) { "main.exe" } else { "main" });
     if command_exists("clang") {
@@ -77,8 +97,10 @@ pub fn build_with_options(file: &Path, options: &CompileOptions) -> XResult<Path
         if let Some(target_triple) = &options.target_triple {
             clang.arg("-target").arg(target_triple);
         }
+        for ir_path in &ir_paths {
+            clang.arg(ir_path);
+        }
         let status = clang
-            .arg(&ir_path)
             .arg("-o")
             .arg(&executable)
             .status()
@@ -95,8 +117,7 @@ pub fn build_with_options(file: &Path, options: &CompileOptions) -> XResult<Path
 
     Err(Diagnostic::backend(
         format!(
-            "wrote LLVM IR to {}; install clang or another LLVM toolchain on PATH to produce a native executable",
-            ir_path.display()
+            "wrote LLVM IR to build/; install clang or another LLVM toolchain on PATH to produce a native executable"
         ),
         1,
         1,

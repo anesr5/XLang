@@ -3,13 +3,20 @@ use crate::diagnostic::Span;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub module: Option<String>,
-    pub imports: Vec<String>,
+    pub imports: Vec<Import>,
     pub structs: Vec<StructDecl>,
     pub functions: Vec<Function>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Import {
+    pub name: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
+    pub pub_export: bool,
     pub name: String,
     pub name_span: Span,
     pub fields: Vec<Field>,
@@ -25,6 +32,7 @@ pub struct Field {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
+    pub pub_export: bool,
     pub name: String,
     pub name_span: Span,
     pub params: Vec<Param>,
@@ -48,6 +56,7 @@ pub enum TypeName {
     Str,
     Void,
     Named(String),
+    Qualified { module: String, name: String },
     Array { elem: Box<TypeName>, len: usize },
 }
 
@@ -58,6 +67,22 @@ impl TypeName {
             _ => None,
         }
     }
+
+    pub fn struct_ref(&self) -> Option<StructRef<'_>> {
+        match self {
+            TypeName::Named(name) => Some(StructRef::Local(name)),
+            TypeName::Qualified { module, name } => {
+                Some(StructRef::Qualified { module, name })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructRef<'a> {
+    Local(&'a str),
+    Qualified { module: &'a str, name: &'a str },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +160,12 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    QualifiedCall {
+        module: String,
+        callee: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
@@ -175,6 +206,7 @@ impl Expr {
             | Expr::Bool { span, .. }
             | Expr::Variable { span, .. }
             | Expr::Call { span, .. }
+            | Expr::QualifiedCall { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::ArrayLiteral { span, .. }

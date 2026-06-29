@@ -133,6 +133,7 @@ pub fn format_type_name(ty: &TypeName) -> String {
         TypeName::Str => "str".to_owned(),
         TypeName::Void => "void".to_owned(),
         TypeName::Named(name) => name.clone(),
+        TypeName::Qualified { module, name } => format!("{module}.{name}"),
         TypeName::Array { elem, len } => format!("{}[{len}]", format_type_name(elem)),
     }
 }
@@ -161,7 +162,7 @@ fn build_index(program: &Program) -> SemanticIndex {
     for import in &program.imports {
         index.symbols.push(Symbol {
             id: alloc_id(),
-            name: import.clone(),
+            name: import.name.clone(),
             kind: SymbolKind::Import,
             span: Span::point(1, 1),
             ty: None,
@@ -397,6 +398,11 @@ fn index_expr(
                 index_expr(index, arg, scope, alloc_id);
             }
         }
+        Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                index_expr(index, arg, scope, alloc_id);
+            }
+        }
         Expr::Unary { expr, .. } => index_expr(index, expr, scope, alloc_id),
         Expr::Binary { left, right, .. } => {
             index_expr(index, left, scope, alloc_id);
@@ -590,7 +596,7 @@ fn push_type_symbol(
     span: Span,
     alloc_id: &mut impl FnMut() -> SymbolId,
 ) {
-    if matches!(ty, TypeName::Named(_)) {
+    if matches!(ty, TypeName::Named(_) | TypeName::Qualified { .. }) {
         return;
     }
     index.symbols.push(Symbol {
@@ -960,7 +966,7 @@ fn type_summary(ty: &TypeName) -> Option<&'static str> {
         TypeName::Bool => Some("Boolean value (`true` or `false`), lowered as LLVM `i1`."),
         TypeName::Str => Some("String type accepted by the frontend; not lowered to LLVM in v0.1."),
         TypeName::Void => Some("Absence of value. Valid only as a function return type."),
-        TypeName::Named(_) => Some("User-defined struct type with stack-allocated locals (v0.3)."),
+        TypeName::Named(_) | TypeName::Qualified { .. } => Some("User-defined struct type with stack-allocated locals (v0.3)."),
         TypeName::Array { elem, .. } => match elem.as_ref() {
             TypeName::I32 => Some("Fixed-size stack array of `i32` elements (v0.2)."),
             TypeName::Bool => Some("Fixed-size stack array of `bool` elements (v0.2)."),
@@ -978,7 +984,7 @@ fn type_usage(ty: &TypeName) -> Option<&'static str> {
             Some("**Usage** — expressions, locals, parameters, return types (frontend only)")
         }
         TypeName::Void => Some("**Usage** — function return type only"),
-        TypeName::Named(_) => Some("**Usage** — local bindings with struct literals"),
+        TypeName::Named(_) | TypeName::Qualified { .. } => Some("**Usage** — local bindings with struct literals"),
         TypeName::Array { .. } => Some("**Usage** — local bindings with array literals"),
     }
 }
@@ -989,7 +995,7 @@ fn type_codegen_note(ty: &TypeName) -> Option<&'static str> {
         TypeName::Str => {
             Some("**Codegen** — not supported (`x check` may pass, `x emit-llvm` fails)")
         }
-        TypeName::Named(_) => Some("**Codegen** — supported (scalar fields only)"),
+        TypeName::Named(_) | TypeName::Qualified { .. } => Some("**Codegen** — supported (scalar fields only)"),
         TypeName::Array { elem, .. } => match elem.as_ref() {
             TypeName::I32 | TypeName::Bool => Some("**Codegen** — supported (with bounds checks)"),
             _ => Some("**Codegen** — not supported"),

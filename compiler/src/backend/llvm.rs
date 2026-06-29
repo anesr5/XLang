@@ -11,12 +11,25 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue,
 };
 
-use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, TypeName, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, StructRef, TypeName, UnaryOp};
 use crate::diagnostic::{Diagnostic, XResult};
+use crate::modules::CompilationUnit;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LlvmOptions {
     pub target_triple: Option<String>,
+}
+
+pub fn emit_compilation_unit(
+    unit: &CompilationUnit,
+    options: &LlvmOptions,
+) -> XResult<std::collections::HashMap<String, String>> {
+    let mut output = std::collections::HashMap::new();
+    for module_name in unit.modules.keys() {
+        let ir = emit_module_ir(unit, module_name, options)?;
+        output.insert(module_name.clone(), ir);
+    }
+    Ok(output)
 }
 
 pub fn emit_llvm_ir(program: &Program) -> XResult<String> {
@@ -24,27 +37,70 @@ pub fn emit_llvm_ir(program: &Program) -> XResult<String> {
 }
 
 pub fn emit_llvm_ir_with_options(program: &Program, options: &LlvmOptions) -> XResult<String> {
+    let unit = CompilationUnit::from_program(program.clone())?;
+    let mut modules = emit_compilation_unit(&unit, options)?;
+    let entry = unit.entry.clone();
+    modules.remove(&entry).ok_or_else(|| {
+        Diagnostic::backend(format!("missing LLVM IR for entry module `{entry}`"), 1, 1)
+    })
+}
+
+fn emit_module_ir(
+    unit: &CompilationUnit,
+    module_name: &str,
+    options: &LlvmOptions,
+) -> XResult<String> {
     let context = Context::create();
-    let mut emitter = LlvmEmitter::new(&context, program, options.target_triple.as_deref());
+    let is_entry = module_name == unit.entry;
+    let mut emitter = LlvmEmitter::new(
+        &context,
+        unit,
+        module_name,
+        is_entry,
+        options.target_triple.as_deref(),
+    );
     emitter.emit_program()
 }
 
-struct LlvmEmitter<'ctx, 'program> {
+fn mangle_function(module_name: &str, function_name: &str, is_entry_main: bool) -> String {
+    if function_name == "main" && is_entry_main {
+        "main".to_owned()
+    } else {
+        format!("xlang.{module_name}.{function_name}")
+    }
+}
+
+fn struct_ir_name(module_name: &str, struct_name: &str) -> String {
+    format!("{module_name}.{struct_name}")
+}
+
+fn struct_key_from_type(module_name: &str, ty: &TypeName) -> Option<String> {
+    match ty.struct_ref()? {
+        StructRef::Local(name) => Some(struct_ir_name(module_name, name)),
+        StructRef::Qualified { module, name } => Some(struct_ir_name(module, name)),
+    }
+}
+
+struct LlvmEmitter<'ctx, 'unit> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    program: &'program Program,
-    functions: HashMap<&'program str, FunctionValue<'ctx>>,
+    unit: &'unit CompilationUnit,
+    module_name: &'unit str,
+    is_entry: bool,
+    program: &'unit Program,
+    functions: HashMap<String, FunctionValue<'ctx>>,
     struct_types: HashMap<String, StructType<'ctx>>,
 }
 
-struct FunctionEmitter<'emit, 'ctx, 'program> {
+struct FunctionEmitter<'emit, 'ctx, 'unit> {
     context: &'ctx Context,
     builder: &'emit Builder<'ctx>,
     function: FunctionValue<'ctx>,
-    functions: &'emit HashMap<&'emit str, FunctionValue<'ctx>>,
+    functions: &'emit HashMap<String, FunctionValue<'ctx>>,
     module: &'emit Module<'ctx>,
-    program: &'program Program,
+    unit: &'unit CompilationUnit,
+    module_name: &'unit str,
     struct_types: &'emit HashMap<String, StructType<'ctx>>,
     locals: HashMap<String, Local<'ctx>>,
     loop_stack: Vec<LoopLabels<'ctx>>,
@@ -63,22 +119,28 @@ struct Local<'ctx> {
     scalar_ty: Option<BasicTypeEnum<'ctx>>,
 }
 
-impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
+impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
     fn new(
         context: &'ctx Context,
-        program: &'program Program,
+        unit: &'unit CompilationUnit,
+        module_name: &'unit str,
+        is_entry: bool,
         target_triple: Option<&str>,
     ) -> Self {
-        let module = context.create_module("xlang");
+        let module = context.create_module(&format!("xlang.{module_name}"));
         if let Some(triple) = target_triple {
             module.set_triple(&TargetTriple::create(triple));
         } else if let Some(triple) = host_target_triple() {
             module.set_triple(&TargetTriple::create(triple));
         }
+        let program = &unit.modules.get(module_name).expect("module").program;
         Self {
             context,
             module,
             builder: context.create_builder(),
+            unit,
+            module_name,
+            is_entry,
             program,
             functions: HashMap::new(),
             struct_types: HashMap::new(),
@@ -89,6 +151,7 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
         self.ensure_supported()?;
         self.declare_struct_types()?;
         self.declare_functions()?;
+        self.declare_external_functions()?;
         for function in &self.program.functions {
             self.emit_function(function)?;
         }
@@ -96,6 +159,40 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
             Diagnostic::backend(format!("LLVM verifier failed: {message}"), 1, 1)
         })?;
         Ok(self.module.print_to_string().to_string())
+    }
+
+    fn declare_external_functions(&mut self) -> XResult<()> {
+        let mut needed = std::collections::HashSet::new();
+        for function in &self.program.functions {
+            collect_qualified_calls(&function.body, &mut needed);
+        }
+        for (import_module, callee) in needed {
+            if import_module == self.module_name {
+                continue;
+            }
+            let Some(target) = self.unit.modules.get(&import_module) else {
+                continue;
+            };
+            let Some(target_fn) = target.program.functions.iter().find(|f| f.name == callee) else {
+                continue;
+            };
+            let symbol = mangle_function(&import_module, &callee, false);
+            if self.functions.contains_key(&symbol) {
+                continue;
+            }
+            let params = target_fn
+                .params
+                .iter()
+                .map(|param| llvm_basic_type(self.context, &param.ty).map(Into::into))
+                .collect::<XResult<Vec<BasicMetadataTypeEnum<'ctx>>>>()?;
+            let function_type = match target_fn.return_type {
+                TypeName::Void => self.context.void_type().fn_type(&params, false),
+                _ => llvm_basic_type(self.context, &target_fn.return_type)?.fn_type(&params, false),
+            };
+            let function_value = self.module.add_function(&symbol, function_type, None);
+            self.functions.insert(symbol, function_value);
+        }
+        Ok(())
     }
 
     fn ensure_supported(&self) -> XResult<()> {
@@ -113,14 +210,33 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
                 ensure_backend_type(&param.ty, param.ty_span)?;
             }
             for stmt in &function.body {
-                ensure_stmt_supported(self.program, stmt)?;
+                ensure_stmt_supported(self.unit, self.module_name, stmt)?;
             }
         }
         Ok(())
     }
 
     fn declare_struct_types(&mut self) -> XResult<()> {
+        let mut struct_keys = std::collections::HashSet::new();
         for struct_decl in &self.program.structs {
+            struct_keys.insert(struct_ir_name(self.module_name, &struct_decl.name));
+        }
+        collect_referenced_struct_types(self.program, self.module_name, &mut struct_keys);
+        for key in struct_keys {
+            let (owner_module, struct_name) = key
+                .split_once('.')
+                .ok_or_else(|| Diagnostic::backend(format!("invalid struct key `{key}`"), 1, 1))?;
+            let owner = self
+                .unit
+                .modules
+                .get(owner_module)
+                .ok_or_else(|| Diagnostic::backend(format!("unknown module `{owner_module}`"), 1, 1))?;
+            let struct_decl = owner
+                .program
+                .structs
+                .iter()
+                .find(|decl| decl.name == struct_name)
+                .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{key}`"), 1, 1))?;
             let field_types = struct_decl
                 .fields
                 .iter()
@@ -128,11 +244,10 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
                 .collect::<XResult<Vec<BasicTypeEnum<'ctx>>>>()?;
             let struct_type = self
                 .context
-                .get_struct_type(&struct_decl.name)
-                .unwrap_or_else(|| self.context.opaque_struct_type(&struct_decl.name));
+                .get_struct_type(&key)
+                .unwrap_or_else(|| self.context.opaque_struct_type(&key));
             struct_type.set_body(&field_types, false);
-            self.struct_types
-                .insert(struct_decl.name.clone(), struct_type);
+            self.struct_types.insert(key, struct_type);
         }
         Ok(())
     }
@@ -148,22 +263,21 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
                 TypeName::Void => self.context.void_type().fn_type(&params, false),
                 _ => llvm_basic_type(self.context, &function.return_type)?.fn_type(&params, false),
             };
-            let function_value = self
-                .module
-                .add_function(&function.name, function_type, None);
-            self.functions
-                .insert(function.name.as_str(), function_value);
+            let symbol = mangle_function(self.module_name, &function.name, self.is_entry);
+            let function_value = self.module.add_function(&symbol, function_type, None);
+            self.functions.insert(symbol, function_value);
         }
         Ok(())
     }
 
     fn emit_function(&self, function: &Function) -> XResult<()> {
+        let symbol = mangle_function(self.module_name, &function.name, self.is_entry);
         let function_value = self
             .functions
-            .get(function.name.as_str())
+            .get(&symbol)
             .copied()
             .ok_or_else(|| {
-                Diagnostic::backend(format!("unknown function `{}`", function.name), 1, 1)
+                Diagnostic::backend(format!("unknown function `{symbol}`"), 1, 1)
             })?;
         let entry = self.context.append_basic_block(function_value, "entry");
         self.builder.position_at_end(entry);
@@ -174,7 +288,8 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
             function: function_value,
             functions: &self.functions,
             module: &self.module,
-            program: self.program,
+            unit: self.unit,
+            module_name: self.module_name,
             struct_types: &self.struct_types,
             locals: HashMap::new(),
             loop_stack: Vec::new(),
@@ -236,7 +351,7 @@ fn host_target_triple() -> Option<&'static str> {
     TRIPLE
 }
 
-impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
+impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
     fn emit_stmt(&mut self, stmt: &Stmt) -> XResult<()> {
         if self.terminated {
             return Ok(());
@@ -249,10 +364,15 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
                 ..
             } => {
                 let source_span = value.span();
-                if let Some(TypeName::Array { elem, len }) = annotation {
-                    self.emit_array_binding(name, elem, *len, value, source_span)?;
-                } else if let Some(TypeName::Named(struct_name)) = annotation {
-                    self.emit_struct_binding(name, struct_name, value, source_span)?;
+                if let Some(array_ty) = annotation {
+                    if let Some((elem, len)) = array_ty.array_elem_len() {
+                        self.emit_array_binding(name, elem, len, value, source_span)?;
+                        return Ok(());
+                    }
+                }
+                if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
+                    let ir_key = struct_key_from_ref(self.module_name, struct_ref);
+                    self.emit_struct_binding(name, &ir_key, annotation.as_ref().unwrap(), value, source_span)?;
                 } else {
                     let value = self.emit_expr(value)?;
                     let Some(value) = value else {
@@ -292,7 +412,7 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
                         source_span,
                     ));
                 }
-                if matches!(local.ty, TypeName::Named(_)) {
+                if matches!(local.ty, TypeName::Named(_) | TypeName::Qualified { .. }) {
                     return Err(Diagnostic::backend_at(
                         "cannot assign to struct binding as a whole",
                         source_span,
@@ -303,20 +423,22 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
             Stmt::AssignField {
                 name, field, value, ..
             } => {
-                let (struct_ptr, struct_name) = {
+                let (struct_ptr, struct_key) = {
                     let local = self.locals.get(name).ok_or_else(|| {
                         Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
                     })?;
-                    let TypeName::Named(struct_name) = &local.ty else {
+                    if local.ty.struct_ref().is_none() {
                         return Err(Diagnostic::backend_at(
                             "field assignment requires struct binding",
                             value.span(),
                         ));
-                    };
-                    (local.pointer, struct_name.clone())
+                    }
+                    let struct_key = struct_key_from_type(self.module_name, &local.ty)
+                        .expect("struct key");
+                    (local.pointer, struct_key)
                 };
-                let field_index = struct_field_index(self.program, &struct_name, field)?;
-                let field_ty = struct_field_type(self.program, &struct_name, field_index)?;
+                let field_index = struct_field_index_for_unit(self.unit, &struct_key, field)?;
+                let field_ty = struct_field_type_for_unit(self.unit, &struct_key, field_index)?;
                 let stored = self.emit_expr(value)?;
                 let Some(stored) = stored else {
                     return Err(Diagnostic::backend_at(
@@ -324,8 +446,7 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
                         value.span(),
                     ));
                 };
-                let field_ptr =
-                    self.emit_struct_field_ptr(struct_ptr, &struct_name, field_index)?;
+                let field_ptr = self.emit_struct_field_ptr(struct_ptr, &struct_key, field_index)?;
                 build_unit(self.builder.build_store(field_ptr, stored))?;
                 let _ = field_ty;
             }
@@ -495,12 +616,13 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
     fn emit_struct_binding(
         &mut self,
         name: &str,
-        struct_name: &str,
+        struct_key: &str,
+        bound_ty: &TypeName,
         value: &Expr,
         source_span: crate::diagnostic::Span,
     ) -> XResult<()> {
-        let struct_ty = self.struct_types.get(struct_name).ok_or_else(|| {
-            Diagnostic::backend_at(format!("unknown struct type `{struct_name}`"), source_span)
+        let struct_ty = self.struct_types.get(struct_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown struct type `{struct_key}`"), source_span)
         })?;
         let slot = build_value(self.builder.build_alloca(*struct_ty, name))?;
         let Expr::StructLiteral { elements, .. } = value else {
@@ -517,14 +639,14 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
                     element.span(),
                 ));
             };
-            let field_ptr = self.emit_struct_field_ptr(slot, struct_name, index)?;
+            let field_ptr = self.emit_struct_field_ptr(slot, struct_key, index)?;
             build_unit(self.builder.build_store(field_ptr, rendered))?;
         }
         self.locals.insert(
             name.to_owned(),
             Local {
                 pointer: slot,
-                ty: TypeName::Named(struct_name.to_owned()),
+                ty: bound_ty.clone(),
                 scalar_ty: None,
             },
         );
@@ -534,11 +656,11 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
     fn emit_struct_field_ptr(
         &mut self,
         struct_ptr: PointerValue<'ctx>,
-        struct_name: &str,
+        struct_key: &str,
         field_index: usize,
     ) -> XResult<PointerValue<'ctx>> {
-        let struct_ty = self.struct_types.get(struct_name).ok_or_else(|| {
-            Diagnostic::backend(format!("unknown struct type `{struct_name}`"), 1, 1)
+        let struct_ty = self.struct_types.get(struct_key).ok_or_else(|| {
+            Diagnostic::backend(format!("unknown struct type `{struct_key}`"), 1, 1)
         })?;
         let zero = self.context.i32_type().const_int(0, false);
         let index = self.context.i32_type().const_int(field_index as u64, false);
@@ -717,7 +839,25 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
                     &format!("{name}.load"),
                 ))?))
             }
-            Expr::Call { callee, args, .. } => self.emit_call(callee, args),
+            Expr::Call { callee, args, .. } => self.emit_call(
+                &mangle_function(
+                    self.module_name,
+                    callee,
+                    self.module_name == self.unit.entry && callee == "main",
+                ),
+                args,
+                false,
+            ),
+            Expr::QualifiedCall {
+                module,
+                callee,
+                args,
+                ..
+            } => self.emit_call(
+                &mangle_function(module, callee, module == &self.unit.entry && callee == "main"),
+                args,
+                true,
+            ),
             Expr::Unary { op, expr, .. } => {
                 if *op == UnaryOp::Negate
                     && let Expr::Integer { value, .. } = expr.as_ref()
@@ -791,22 +931,23 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
                         base.span(),
                     ));
                 };
-                let (struct_ptr, struct_name) = {
+                let (struct_ptr, struct_key) = {
                     let local = self.locals.get(name).ok_or_else(|| {
                         Diagnostic::backend_at(format!("unknown variable `{name}`"), *base_span)
                     })?;
-                    let TypeName::Named(struct_name) = &local.ty else {
+                    if local.ty.struct_ref().is_none() {
                         return Err(Diagnostic::backend_at(
                             "field access requires struct binding",
                             *field_span,
                         ));
-                    };
-                    (local.pointer, struct_name.clone())
+                    }
+                    let struct_key = struct_key_from_type(self.module_name, &local.ty)
+                        .expect("struct key");
+                    (local.pointer, struct_key)
                 };
-                let field_index = struct_field_index(self.program, &struct_name, field)?;
-                let field_ty = struct_field_type(self.program, &struct_name, field_index)?;
-                let field_ptr =
-                    self.emit_struct_field_ptr(struct_ptr, &struct_name, field_index)?;
+                let field_index = struct_field_index_for_unit(self.unit, &struct_key, field)?;
+                let field_ty = struct_field_type_for_unit(self.unit, &struct_key, field_index)?;
+                let field_ptr = self.emit_struct_field_ptr(struct_ptr, &struct_key, field_index)?;
                 let scalar_ty = llvm_scalar_type(self.context, &field_ty, *field_span)?;
                 Ok(Some(build_value(self.builder.build_load(
                     scalar_ty,
@@ -817,12 +958,17 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
         }
     }
 
-    fn emit_call(&mut self, callee: &str, args: &[Expr]) -> XResult<Option<BasicValueEnum<'ctx>>> {
+    fn emit_call(
+        &mut self,
+        symbol: &str,
+        args: &[Expr],
+        _external: bool,
+    ) -> XResult<Option<BasicValueEnum<'ctx>>> {
         let function = self
             .functions
-            .get(callee)
+            .get(symbol)
             .copied()
-            .ok_or_else(|| Diagnostic::backend(format!("unknown function `{callee}`"), 1, 1))?;
+            .ok_or_else(|| Diagnostic::backend(format!("unknown function `{symbol}`"), 1, 1))?;
         let mut rendered = Vec::new();
         for arg in args {
             let value = self.emit_expr(arg)?;
@@ -969,13 +1115,17 @@ impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
     }
 }
 
-fn ensure_stmt_supported(program: &Program, stmt: &Stmt) -> XResult<()> {
+fn ensure_stmt_supported(
+    unit: &CompilationUnit,
+    module_name: &str,
+    stmt: &Stmt,
+) -> XResult<()> {
     match stmt {
         Stmt::Let {
             value, annotation, ..
         } => {
             if let Some(ty) = annotation {
-                ensure_local_type_supported(program, ty, value.span())?;
+                ensure_local_type_supported(unit, module_name, ty, value.span())?;
             }
             ensure_expr_supported(value)
         }
@@ -991,7 +1141,7 @@ fn ensure_stmt_supported(program: &Program, stmt: &Stmt) -> XResult<()> {
         } => {
             ensure_expr_supported(condition)?;
             for stmt in body {
-                ensure_stmt_supported(program, stmt)?;
+                ensure_stmt_supported(unit, module_name, stmt)?;
             }
             Ok(())
         }
@@ -1008,7 +1158,7 @@ fn ensure_stmt_supported(program: &Program, stmt: &Stmt) -> XResult<()> {
         } => {
             ensure_expr_supported(condition)?;
             for stmt in then_body.iter().chain(else_body.iter()) {
-                ensure_stmt_supported(program, stmt)?;
+                ensure_stmt_supported(unit, module_name, stmt)?;
             }
             Ok(())
         }
@@ -1018,7 +1168,7 @@ fn ensure_stmt_supported(program: &Program, stmt: &Stmt) -> XResult<()> {
 fn ensure_expr_supported(expr: &Expr) -> XResult<()> {
     match expr {
         Expr::String { span, .. } => Err(unsupported_backend_type(*span)),
-        Expr::Call { args, .. } => {
+        Expr::Call { args, .. } | Expr::QualifiedCall { args, .. } => {
             for arg in args {
                 ensure_expr_supported(arg)?;
             }
@@ -1057,7 +1207,7 @@ fn ensure_struct_field_backend_type(ty: &TypeName, span: crate::diagnostic::Span
             "LLVM backend does not support struct field type str",
             span,
         )),
-        TypeName::Named(_) => Err(Diagnostic::backend_at(
+        TypeName::Named(_) | TypeName::Qualified { .. } => Err(Diagnostic::backend_at(
             "LLVM backend does not support nested struct fields yet",
             span,
         )),
@@ -1071,14 +1221,17 @@ fn ensure_array_element_backend_type(
 ) -> XResult<()> {
     match elem {
         TypeName::I32 | TypeName::Bool => Ok(()),
-        TypeName::Str | TypeName::Named(_) | TypeName::Void | TypeName::Array { .. } => {
-            Err(unsupported_backend_type(span))
-        }
+        TypeName::Str
+        | TypeName::Named(_)
+        | TypeName::Qualified { .. }
+        | TypeName::Void
+        | TypeName::Array { .. } => Err(unsupported_backend_type(span)),
     }
 }
 
 fn ensure_local_type_supported(
-    program: &Program,
+    unit: &CompilationUnit,
+    module_name: &str,
     ty: &TypeName,
     span: crate::diagnostic::Span,
 ) -> XResult<()> {
@@ -1086,12 +1239,16 @@ fn ensure_local_type_supported(
         TypeName::I32 | TypeName::Bool | TypeName::Void => Ok(()),
         TypeName::Array { elem, .. } => ensure_array_element_backend_type(elem, span),
         TypeName::Named(name) => {
-            let Some(struct_decl) = program.structs.iter().find(|s| s.name == *name) else {
-                return Err(Diagnostic::backend_at(
-                    format!("unknown struct type `{name}`"),
-                    span,
-                ));
-            };
+            let key = struct_ir_name(module_name, name);
+            let struct_decl = struct_decl_for_key(unit, &key)?;
+            for field in &struct_decl.fields {
+                ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+            }
+            Ok(())
+        }
+        TypeName::Qualified { module, name } => {
+            let key = struct_ir_name(module, name);
+            let struct_decl = struct_decl_for_key(unit, &key)?;
             for field in &struct_decl.fields {
                 ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
             }
@@ -1101,42 +1258,214 @@ fn ensure_local_type_supported(
     }
 }
 
-fn struct_field_index(program: &Program, struct_name: &str, field: &str) -> XResult<usize> {
-    let struct_decl = program
-        .structs
-        .iter()
-        .find(|s| s.name == struct_name)
-        .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{struct_name}`"), 1, 1))?;
+fn struct_key_from_ref(module_name: &str, struct_ref: StructRef<'_>) -> String {
+    match struct_ref {
+        StructRef::Local(name) => struct_ir_name(module_name, name),
+        StructRef::Qualified { module, name } => struct_ir_name(module, name),
+    }
+}
+
+fn struct_field_index_for_unit(
+    unit: &CompilationUnit,
+    struct_key: &str,
+    field: &str,
+) -> XResult<usize> {
+    let struct_decl = struct_decl_for_key(unit, struct_key)?;
     struct_decl
         .fields
         .iter()
         .position(|f| f.name == field)
         .ok_or_else(|| {
             Diagnostic::backend(
-                format!("struct `{struct_name}` has no field `{field}`"),
+                format!("struct `{struct_key}` has no field `{field}`"),
                 1,
                 1,
             )
         })
 }
 
-fn struct_field_type(
-    program: &Program,
-    struct_name: &str,
+fn struct_field_type_for_unit(
+    unit: &CompilationUnit,
+    struct_key: &str,
     field_index: usize,
 ) -> XResult<TypeName> {
-    let struct_decl = program
-        .structs
-        .iter()
-        .find(|s| s.name == struct_name)
-        .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{struct_name}`"), 1, 1))?;
+    let struct_decl = struct_decl_for_key(unit, struct_key)?;
     struct_decl
         .fields
         .get(field_index)
         .map(|field| field.ty.clone())
         .ok_or_else(|| {
-            Diagnostic::backend(format!("invalid field index for `{struct_name}`"), 1, 1)
+            Diagnostic::backend(format!("invalid field index for `{struct_key}`"), 1, 1)
         })
+}
+
+fn struct_decl_for_key<'a>(
+    unit: &'a CompilationUnit,
+    struct_key: &str,
+) -> XResult<&'a crate::ast::StructDecl> {
+    let (module_name, struct_name) = struct_key.split_once('.').ok_or_else(|| {
+        Diagnostic::backend(format!("invalid struct key `{struct_key}`"), 1, 1)
+    })?;
+    let module = unit
+        .modules
+        .get(module_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown module `{module_name}`"), 1, 1))?;
+    module
+        .program
+        .structs
+        .iter()
+        .find(|decl| decl.name == struct_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{struct_key}`"), 1, 1))
+}
+
+fn collect_referenced_struct_types(
+    program: &Program,
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    for function in &program.functions {
+        collect_struct_types_in_stmts(&function.body, module_name, keys);
+    }
+}
+
+fn collect_struct_types_in_stmts(
+    stmts: &[Stmt],
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { annotation, value, .. } => {
+                if let Some(ty) = annotation
+                    && let Some(key) = struct_key_from_type(module_name, ty)
+                {
+                    keys.insert(key);
+                }
+                collect_struct_types_in_expr(value, module_name, keys);
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::Return { value: Some(value), .. }
+            | Stmt::Expr(value) => collect_struct_types_in_expr(value, module_name, keys),
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_struct_types_in_expr(condition, module_name, keys);
+                collect_struct_types_in_stmts(then_body, module_name, keys);
+                collect_struct_types_in_stmts(else_body, module_name, keys);
+            }
+            Stmt::While { condition, body, .. } => {
+                collect_struct_types_in_expr(condition, module_name, keys);
+                collect_struct_types_in_stmts(body, module_name, keys);
+            }
+            Stmt::AssignIndex { index, value, .. } => {
+                collect_struct_types_in_expr(index, module_name, keys);
+                collect_struct_types_in_expr(value, module_name, keys);
+            }
+            Stmt::AssignField { value, .. } => {
+                collect_struct_types_in_expr(value, module_name, keys);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_struct_types_in_expr(
+    expr: &Expr,
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expr::Call { args, .. } | Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_struct_types_in_expr(arg, module_name, keys);
+            }
+        }
+        Expr::Unary { expr, .. } => collect_struct_types_in_expr(expr, module_name, keys),
+        Expr::Binary { left, right, .. } => {
+            collect_struct_types_in_expr(left, module_name, keys);
+            collect_struct_types_in_expr(right, module_name, keys);
+        }
+        Expr::ArrayLiteral { elements, .. } | Expr::StructLiteral { elements, .. } => {
+            for element in elements {
+                collect_struct_types_in_expr(element, module_name, keys);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            collect_struct_types_in_expr(base, module_name, keys);
+            collect_struct_types_in_expr(index, module_name, keys);
+        }
+        Expr::FieldAccess { base, .. } => collect_struct_types_in_expr(base, module_name, keys),
+        _ => {}
+    }
+}
+
+fn collect_qualified_calls(stmts: &[Stmt], needed: &mut std::collections::HashSet<(String, String)>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { value, .. }
+            | Stmt::Assign { value, .. }
+            | Stmt::Return { value: Some(value), .. }
+            | Stmt::Expr(value) => collect_qualified_calls_in_expr(value, needed),
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_qualified_calls_in_expr(condition, needed);
+                collect_qualified_calls(then_body, needed);
+                collect_qualified_calls(else_body, needed);
+            }
+            Stmt::While { condition, body, .. } => {
+                collect_qualified_calls_in_expr(condition, needed);
+                collect_qualified_calls(body, needed);
+            }
+            Stmt::AssignIndex { index, value, .. } => {
+                collect_qualified_calls_in_expr(index, needed);
+                collect_qualified_calls_in_expr(value, needed);
+            }
+            Stmt::AssignField { value, .. } => collect_qualified_calls_in_expr(value, needed),
+            _ => {}
+        }
+    }
+}
+
+fn collect_qualified_calls_in_expr(
+    expr: &Expr,
+    needed: &mut std::collections::HashSet<(String, String)>,
+) {
+    match expr {
+        Expr::QualifiedCall { module, callee, args, .. } => {
+            needed.insert((module.clone(), callee.clone()));
+            for arg in args {
+                collect_qualified_calls_in_expr(arg, needed);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_qualified_calls_in_expr(arg, needed);
+            }
+        }
+        Expr::Unary { expr, .. } => collect_qualified_calls_in_expr(expr, needed),
+        Expr::Binary { left, right, .. } => {
+            collect_qualified_calls_in_expr(left, needed);
+            collect_qualified_calls_in_expr(right, needed);
+        }
+        Expr::ArrayLiteral { elements, .. } | Expr::StructLiteral { elements, .. } => {
+            for element in elements {
+                collect_qualified_calls_in_expr(element, needed);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            collect_qualified_calls_in_expr(base, needed);
+            collect_qualified_calls_in_expr(index, needed);
+        }
+        Expr::FieldAccess { base, .. } => collect_qualified_calls_in_expr(base, needed),
+        _ => {}
+    }
 }
 
 fn llvm_scalar_type<'ctx>(
@@ -1154,7 +1483,7 @@ fn llvm_scalar_type<'ctx>(
 fn ensure_backend_type(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
     match ty {
         TypeName::I32 | TypeName::Bool | TypeName::Void => Ok(()),
-        TypeName::Array { .. } | TypeName::Str | TypeName::Named(_) => {
+        TypeName::Array { .. } | TypeName::Str | TypeName::Named(_) | TypeName::Qualified { .. } => {
             Err(unsupported_backend_type(span))
         }
     }
@@ -1178,7 +1507,7 @@ fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: &TypeName) -> XResult<Basic
     match ty {
         TypeName::I32 => Ok(context.i32_type().as_basic_type_enum()),
         TypeName::Bool => Ok(context.bool_type().as_basic_type_enum()),
-        TypeName::Void | TypeName::Str | TypeName::Named(_) | TypeName::Array { .. } => Err(
+        TypeName::Void | TypeName::Str | TypeName::Named(_) | TypeName::Qualified { .. } | TypeName::Array { .. } => Err(
             unsupported_backend_type(crate::diagnostic::Span::point(1, 1)),
         ),
     }

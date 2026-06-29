@@ -6,6 +6,7 @@ pub mod lexer;
 #[cfg(windows)]
 mod llvm_windows_shim;
 pub mod lsp;
+pub mod modules;
 pub mod parser;
 pub mod token;
 pub mod typeck;
@@ -129,10 +130,10 @@ i32 main() {
     #[test]
     fn parses_checks_and_emits_llvm_for_demo_program() {
         let checked = compile::check_source(DEMO).unwrap();
-        assert_eq!(checked.program.functions.len(), 2);
+        assert_eq!(checked.program().functions.len(), 2);
         let llvm_ir = compile::emit_llvm_source(DEMO).unwrap();
         assert!(llvm_ir.contains("define i32 @main()"));
-        assert!(llvm_ir.contains("call i32 @add(i32 40, i32 2)"));
+        assert!(llvm_ir.contains("call i32 @xlang.main.add(i32 40, i32 2)"));
     }
 
     #[test]
@@ -150,7 +151,7 @@ i32 main() {
                 left, op, right, ..
             }),
             ..
-        } = &checked.program.functions[0].body[0]
+        } = &checked.program().functions[0].body[0]
         else {
             panic!("expected binary return expression");
         };
@@ -182,7 +183,7 @@ i32 main() {
         let Stmt::Return {
             value: Some(Expr::Binary { op, right, .. }),
             ..
-        } = &checked.program.functions[0].body[0]
+        } = &checked.program().functions[0].body[0]
         else {
             panic!("expected binary return expression");
         };
@@ -211,7 +212,7 @@ i32 main() {
         )
         .unwrap();
         assert!(matches!(
-            checked.program.functions[0].body[0],
+            checked.program().functions[0].body[0],
             Stmt::If { .. }
         ));
     }
@@ -224,11 +225,11 @@ i32 main() {
         let llvm_ir = compile::emit_llvm_source_with_options(DEMO, &options).unwrap();
         assert_eq!(
             llvm_ir,
-            r#"; ModuleID = 'xlang'
-source_filename = "xlang"
+            r#"; ModuleID = 'xlang.main'
+source_filename = "xlang.main"
 target triple = "x86_64-unknown-linux-gnu"
 
-define i32 @add(i32 %a, i32 %b) {
+define i32 @xlang.main.add(i32 %a, i32 %b) {
 entry:
   %a.addr = alloca i32, align 4
   store i32 %a, ptr %a.addr, align 4
@@ -242,7 +243,7 @@ entry:
 
 define i32 @main() {
 entry:
-  %calltmp = call i32 @add(i32 40, i32 2)
+  %calltmp = call i32 @xlang.main.add(i32 40, i32 2)
   %x = alloca i32, align 4
   store i32 %calltmp, ptr %x, align 4
   %x.load = load i32, ptr %x, align 4
@@ -297,7 +298,7 @@ i32 main() {
     #[test]
     fn build_pipeline_does_not_use_c_as_ir_or_gcc() {
         let compile_source = include_str!("compile.rs");
-        assert!(compile_source.contains("main.ll"));
+        assert!(compile_source.contains("{module_name}.ll"));
         assert!(compile_source.contains("clang"));
         assert!(!compile_source.contains("main.c"));
         assert!(!compile_source.contains("gcc"));
@@ -328,7 +329,7 @@ i32 main() {
         assert!(llvm_ir.contains("and.rhs"));
         assert!(llvm_ir.contains("and.end"));
         assert!(llvm_ir.contains("phi i1"));
-        assert!(llvm_ir.contains("call i1 @expensive()"));
+        assert!(llvm_ir.contains("call i1 @xlang.main.expensive()"));
     }
 
     #[test]
@@ -351,7 +352,7 @@ i32 main() {
         assert!(llvm_ir.contains("or.rhs"));
         assert!(llvm_ir.contains("or.end"));
         assert!(llvm_ir.contains("phi i1"));
-        assert!(llvm_ir.contains("call i1 @expensive()"));
+        assert!(llvm_ir.contains("call i1 @xlang.main.expensive()"));
     }
 
     #[test]
@@ -387,8 +388,8 @@ i32 main() {
 }
 "#;
         let checked = compile::check_source(source).unwrap();
-        assert_eq!(checked.program.structs.len(), 1);
-        assert_eq!(checked.program.structs[0].fields.len(), 2);
+        assert_eq!(checked.program().structs.len(), 1);
+        assert_eq!(checked.program().structs[0].fields.len(), 2);
     }
 
     #[test]
@@ -613,7 +614,7 @@ i32 main() {
 "#,
         )
         .unwrap();
-        assert!(llvm_ir.contains("define void @tick()"));
+        assert!(llvm_ir.contains("define void @xlang.main.tick()"));
         assert!(llvm_ir.contains("ret void"));
     }
 
@@ -952,13 +953,21 @@ i32 main() {
 "#,
         )
         .unwrap();
-        assert_eq!(checked.program.module.as_deref(), Some("main"));
-        assert_eq!(checked.program.imports, ["math", "io"]);
+        assert_eq!(checked.program().module.as_deref(), Some("main"));
+        assert_eq!(
+            checked
+                .program()
+                .imports
+                .iter()
+                .map(|import| import.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["math", "io"]
+        );
     }
 
     #[test]
-    fn preserves_duplicate_imports_as_syntax_only() {
-        let checked = compile::check_source(
+    fn rejects_duplicate_imports() {
+        let err = compile::check_source(
             r#"
 module main
 import io
@@ -969,8 +978,8 @@ i32 main() {
 }
 "#,
         )
-        .unwrap();
-        assert_eq!(checked.program.imports, ["io", "io"]);
+        .unwrap_err();
+        assert!(err.message.contains("duplicate import"));
     }
 
     #[test]
@@ -1382,7 +1391,7 @@ i32 main() {
 "#;
         compile::check_source(source).unwrap();
         let llvm_ir = compile::emit_llvm_source(source).unwrap();
-        assert!(llvm_ir.contains("%Vec2 = type"));
+        assert!(llvm_ir.contains("%main.Vec2 = type"));
         assert!(llvm_ir.contains("field.load"));
     }
 
@@ -1502,6 +1511,13 @@ i32 main() {
 "#;
         let err = compile::check_source(source).unwrap_err();
         assert!(err.message.contains("nested struct field type"));
+    }
+
+    #[test]
+    fn v0_4_multi_module_example_typechecks() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/v0.4/main.x");
+        compile::check(&path).unwrap();
     }
 
     #[test]

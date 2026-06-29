@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, TypeName, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, StructRef, TypeName, UnaryOp};
 use crate::diagnostic::{Diagnostic, Span, XResult};
+use crate::modules::{CompilationUnit, LoadedModule};
 
 #[derive(Debug, Clone)]
 struct FunctionSig {
@@ -10,26 +11,60 @@ struct FunctionSig {
     return_type: TypeName,
     return_type_span: Option<Span>,
     name_span: Span,
-}
-
-pub fn check(program: &Program) -> XResult<()> {
-    TypeChecker::new(program)?.check_program(program)
+    pub_export: bool,
 }
 
 #[derive(Debug, Clone)]
 struct StructLayout {
     fields: Vec<(String, TypeName)>,
+    pub_export: bool,
 }
 
-struct TypeChecker {
+#[derive(Debug, Clone)]
+struct ModuleExports {
     functions: HashMap<String, FunctionSig>,
     structs: HashMap<String, StructLayout>,
 }
 
-impl TypeChecker {
-    fn new(program: &Program) -> XResult<Self> {
-        let structs = build_struct_layouts(program)?;
-        validate_structs(program, &structs)?;
+pub fn check_unit(unit: &CompilationUnit) -> XResult<()> {
+    let exports = build_unit_exports(unit)?;
+    validate_main_across_unit(unit, &exports)?;
+    for module in unit.modules.values() {
+        TypeChecker::check_module(unit, &exports, module)?;
+    }
+    Ok(())
+}
+
+pub fn check(program: &Program) -> XResult<()> {
+    check_unit(&CompilationUnit::from_program(program.clone())?)
+}
+
+struct TypeChecker<'a> {
+    module_name: &'a str,
+    imports: HashSet<String>,
+    exports: &'a HashMap<String, ModuleExports>,
+    functions: HashMap<String, FunctionSig>,
+    structs: HashMap<String, StructLayout>,
+}
+
+impl<'a> TypeChecker<'a> {
+    fn check_module(
+        unit: &'a CompilationUnit,
+        exports: &'a HashMap<String, ModuleExports>,
+        module: &'a LoadedModule,
+    ) -> XResult<()> {
+        let checker = Self::new(unit, exports, module)?;
+        checker.check_program(&module.program)
+    }
+
+    fn new(
+        unit: &'a CompilationUnit,
+        exports: &'a HashMap<String, ModuleExports>,
+        module: &'a LoadedModule,
+    ) -> XResult<Self> {
+        let program = &module.program;
+        let structs = build_struct_layouts(program, module.implicit_pub)?;
+        validate_structs(unit, module.name.as_str(), program, &structs, exports)?;
         let mut functions = HashMap::new();
         for function in &program.functions {
             if functions.contains_key(&function.name) {
@@ -46,14 +81,18 @@ impl TypeChecker {
                     return_type: function.return_type.clone(),
                     return_type_span: function.return_type_span,
                     name_span: function.name_span,
+                    pub_export: function.pub_export || module.implicit_pub,
                 },
             );
         }
-        if !functions.contains_key("main") {
-            return Err(Diagnostic::type_error("program must define `main()`", 1, 1));
-        }
-        validate_main_signature(&functions)?;
-        Ok(Self { functions, structs })
+        let imports = program.imports.iter().map(|i| i.name.clone()).collect();
+        Ok(Self {
+            module_name: &module.name,
+            imports,
+            exports,
+            functions,
+            structs,
+        })
     }
 
     fn check_program(&self, program: &Program) -> XResult<()> {
@@ -128,20 +167,16 @@ impl TypeChecker {
                         annotation_span.unwrap_or(*name_span),
                     ));
                 }
-                let binding_ty = if let Some(TypeName::Named(struct_name)) = annotation {
-                    validate_struct_local_type(
-                        &self.structs,
-                        struct_name,
-                        annotation_span.unwrap_or(*name_span),
-                    )?;
+                let binding_ty = if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
+                    self.validate_struct_local_type(struct_ref, annotation_span.unwrap_or(*name_span))?;
                     if !matches!(value, Expr::StructLiteral { .. }) {
                         return Err(Diagnostic::type_error_at(
                             format!("struct local `{name}` requires a struct literal initializer"),
                             value.span(),
                         ));
                     }
-                    self.check_struct_literal(struct_name, value, locals)?;
-                    TypeName::Named(struct_name.clone())
+                    self.check_struct_literal(struct_ref, value, locals)?;
+                    annotation.clone().unwrap()
                 } else {
                     if let Some(array_ty) = annotation {
                         validate_array_local_type(array_ty, annotation_span.unwrap_or(*name_span))?;
@@ -201,7 +236,7 @@ impl TypeChecker {
                         *name_span,
                     ));
                 }
-                if matches!(target_ty, TypeName::Named(_)) {
+                if matches!(target_ty, TypeName::Named(_) | TypeName::Qualified { .. }) {
                     return Err(Diagnostic::type_error_at(
                         format!("cannot assign to struct binding `{name}` as a whole"),
                         *name_span,
@@ -239,7 +274,7 @@ impl TypeChecker {
                         *field_span,
                     ));
                 }
-                let TypeName::Named(struct_name) = target_ty else {
+                if !matches!(target_ty, TypeName::Named(_) | TypeName::Qualified { .. }) {
                     return Err(Diagnostic::type_error_at(
                         format!(
                             "cannot access field on value of type {}",
@@ -248,7 +283,8 @@ impl TypeChecker {
                         *field_span,
                     ));
                 };
-                let (_, field_ty) = self.resolve_struct_field(struct_name, field, *field_span)?;
+                let struct_ref = target_ty.struct_ref().expect("struct ref");
+                let (_, field_ty) = self.resolve_struct_field(struct_ref, field, *field_span)?;
                 let value_ty = self.check_expr(value, locals)?;
                 if value_ty != *field_ty {
                     return Err(Diagnostic::type_error_at(
@@ -444,6 +480,12 @@ impl TypeChecker {
                 })
             }
             Expr::Call { callee, args, span } => self.check_call(callee, args, locals, *span),
+            Expr::QualifiedCall {
+                module,
+                callee,
+                args,
+                span,
+            } => self.check_qualified_call(module, callee, args, locals, *span),
             Expr::Unary { op, expr, span } => {
                 if *op == UnaryOp::Negate
                     && let Expr::Integer { value, .. } = expr.as_ref()
@@ -553,7 +595,7 @@ impl TypeChecker {
                         *base_span,
                     ));
                 };
-                let TypeName::Named(struct_name) = base_ty else {
+                if !matches!(base_ty, TypeName::Named(_) | TypeName::Qualified { .. }) {
                     return Err(Diagnostic::type_error_at(
                         format!(
                             "cannot access field on value of type {}",
@@ -562,7 +604,8 @@ impl TypeChecker {
                         *field_span,
                     ));
                 };
-                let (_, field_ty) = self.resolve_struct_field(struct_name, field, *field_span)?;
+                let struct_ref = base_ty.struct_ref().expect("struct ref");
+                let (_, field_ty) = self.resolve_struct_field(struct_ref, field, *field_span)?;
                 Ok(field_ty.clone())
             }
         }
@@ -570,7 +613,7 @@ impl TypeChecker {
 
     fn check_struct_literal(
         &self,
-        struct_name: &str,
+        struct_ref: StructRef<'_>,
         value: &Expr,
         locals: &HashMap<String, (TypeName, bool)>,
     ) -> XResult<()> {
@@ -580,9 +623,7 @@ impl TypeChecker {
                 value.span(),
             ));
         };
-        let layout = self.structs.get(struct_name).ok_or_else(|| {
-            Diagnostic::type_error_at(format!("unknown struct type `{struct_name}`"), *span)
-        })?;
+        let layout = self.resolve_struct_layout(struct_ref, *span)?;
         if elements.len() != layout.fields.len() {
             return Err(Diagnostic::type_error_at(
                 format!(
@@ -611,15 +652,13 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn resolve_struct_field<'a>(
-        &'a self,
-        struct_name: &str,
+    fn resolve_struct_field<'b>(
+        &'b self,
+        struct_ref: StructRef<'_>,
         field: &str,
         span: Span,
-    ) -> XResult<(&'a str, &'a TypeName)> {
-        let layout = self.structs.get(struct_name).ok_or_else(|| {
-            Diagnostic::type_error_at(format!("unknown struct type `{struct_name}`"), span)
-        })?;
+    ) -> XResult<(&'b str, &'b TypeName)> {
+        let layout = self.resolve_struct_layout(struct_ref, span)?;
         layout
             .fields
             .iter()
@@ -627,10 +666,53 @@ impl TypeChecker {
             .map(|(name, ty)| (name.as_str(), ty))
             .ok_or_else(|| {
                 Diagnostic::type_error_at(
-                    format!("struct `{struct_name}` has no field `{field}`"),
+                    format!(
+                        "struct `{}` has no field `{field}`",
+                        struct_ref_display(struct_ref)
+                    ),
                     span,
                 )
             })
+    }
+
+    fn resolve_struct_layout<'b>(
+        &'b self,
+        struct_ref: StructRef<'_>,
+        span: Span,
+    ) -> XResult<&'b StructLayout> {
+        match struct_ref {
+            StructRef::Local(name) => self.structs.get(name).ok_or_else(|| {
+                Diagnostic::type_error_at(format!("unknown struct type `{name}`"), span)
+            }),
+            StructRef::Qualified { module, name } => {
+                if module != self.module_name && !self.imports.contains(module) {
+                    return Err(Diagnostic::type_error_at(
+                        format!("unknown module `{module}`"),
+                        span,
+                    ));
+                }
+                let module_exports = self.exports.get(module).ok_or_else(|| {
+                    Diagnostic::type_error_at(format!("unknown module `{module}`"), span)
+                })?;
+                let layout = module_exports.structs.get(name).ok_or_else(|| {
+                    Diagnostic::type_error_at(
+                        format!("unknown struct type `{module}.{name}`"),
+                        span,
+                    )
+                })?;
+                if module != self.module_name && !layout.pub_export {
+                    return Err(Diagnostic::type_error_at(
+                        format!("cannot use private struct `{name}` from module `{module}`"),
+                        span,
+                    ));
+                }
+                Ok(layout)
+            }
+        }
+    }
+
+    fn validate_struct_local_type(&self, struct_ref: StructRef<'_>, span: Span) -> XResult<()> {
+        self.resolve_struct_layout(struct_ref, span).map(|_| ())
     }
 
     fn check_call(
@@ -669,6 +751,70 @@ impl TypeChecker {
                     format!(
                         "argument type mismatch: expected {:?}, got {:?}",
                         expected, actual
+                    ),
+                    arg.span(),
+                ));
+            }
+        }
+        Ok(sig.return_type.clone())
+    }
+
+    fn check_qualified_call(
+        &self,
+        module: &str,
+        callee: &str,
+        args: &[Expr],
+        locals: &HashMap<String, (TypeName, bool)>,
+        span: Span,
+    ) -> XResult<TypeName> {
+        if !self.imports.contains(module) {
+            return Err(Diagnostic::type_error_at(
+                format!("unknown module `{module}`"),
+                span,
+            ));
+        }
+        let Some(module_exports) = self.exports.get(module) else {
+            return Err(Diagnostic::type_error_at(
+                format!("unknown module `{module}`"),
+                span,
+            ));
+        };
+        let Some(sig) = module_exports.functions.get(callee) else {
+            return Err(Diagnostic::type_error_at(
+                format!("unknown function `{module}.{callee}`"),
+                span,
+            ));
+        };
+        if module != self.module_name && !sig.pub_export {
+            return Err(Diagnostic::type_error_at(
+                format!("`{callee}` is private to module `{module}`"),
+                span,
+            ));
+        }
+        if sig.params.len() != args.len() {
+            return Err(Diagnostic::type_error_at(
+                format!(
+                    "function `{module}.{callee}` expects {} arguments, got {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        for (arg, expected) in args.iter().zip(sig.params.iter()) {
+            let actual = self.check_expr(arg, locals)?;
+            if actual == TypeName::Void {
+                return Err(Diagnostic::type_error_at(
+                    "cannot pass void expression as an argument",
+                    arg.span(),
+                ));
+            }
+            if &actual != expected {
+                return Err(Diagnostic::type_error_at(
+                    format!(
+                        "argument type mismatch: expected {}, got {}",
+                        type_name_display(expected),
+                        type_name_display(&actual)
                     ),
                     arg.span(),
                 ));
@@ -811,7 +957,7 @@ fn validate_array_local_type(ty: &TypeName, span: Span) -> XResult<()> {
             "array element type cannot be void",
             span,
         )),
-        TypeName::Named(name) => Err(Diagnostic::type_error_at(
+        TypeName::Named(name) | TypeName::Qualified { name, .. } => Err(Diagnostic::type_error_at(
             format!("array element type `{name}` is not supported yet"),
             span,
         )),
@@ -836,16 +982,84 @@ fn check_constant_index_in_bounds(index: &Expr, len: usize) -> XResult<()> {
 
 fn type_name_display(ty: &TypeName) -> String {
     match ty {
-        TypeName::I32 => "I32".to_owned(),
-        TypeName::Bool => "Bool".to_owned(),
-        TypeName::Str => "Str".to_owned(),
-        TypeName::Void => "Void".to_owned(),
+        TypeName::I32 => "i32".to_owned(),
+        TypeName::Bool => "bool".to_owned(),
+        TypeName::Str => "str".to_owned(),
+        TypeName::Void => "void".to_owned(),
         TypeName::Named(name) => name.clone(),
+        TypeName::Qualified { module, name } => format!("{module}.{name}"),
         TypeName::Array { elem, len } => format!("{}[{len}]", type_name_display(elem)),
     }
 }
 
-fn build_struct_layouts(program: &Program) -> XResult<HashMap<String, StructLayout>> {
+fn struct_ref_display(struct_ref: StructRef<'_>) -> String {
+    match struct_ref {
+        StructRef::Local(name) => name.to_owned(),
+        StructRef::Qualified { module, name } => format!("{module}.{name}"),
+    }
+}
+
+fn build_unit_exports(unit: &CompilationUnit) -> XResult<HashMap<String, ModuleExports>> {
+    let mut exports = HashMap::new();
+    for module in unit.modules.values() {
+        let structs = build_struct_layouts(&module.program, module.implicit_pub)?;
+        let mut functions = HashMap::new();
+        for function in &module.program.functions {
+            functions.insert(
+                function.name.clone(),
+                FunctionSig {
+                    params: function.params.iter().map(|p| p.ty.clone()).collect(),
+                    first_param_span: function.params.first().map(|p| p.name_span),
+                    return_type: function.return_type.clone(),
+                    return_type_span: function.return_type_span,
+                    name_span: function.name_span,
+                    pub_export: function.pub_export || module.implicit_pub,
+                },
+            );
+        }
+        exports.insert(
+            module.name.clone(),
+            ModuleExports { functions, structs },
+        );
+    }
+    Ok(exports)
+}
+
+fn validate_main_across_unit(
+    unit: &CompilationUnit,
+    exports: &HashMap<String, ModuleExports>,
+) -> XResult<()> {
+    let mut main_modules = Vec::new();
+    for (name, module_exports) in exports {
+        if module_exports.functions.contains_key("main") {
+            main_modules.push(name.clone());
+        }
+    }
+    if main_modules.is_empty() {
+        return Err(Diagnostic::type_error("program must define `main()`", 1, 1));
+    }
+    if main_modules.len() > 1 {
+        return Err(Diagnostic::type_error(
+            format!("multiple `main` functions found in modules: {}", main_modules.join(", ")),
+            1,
+            1,
+        ));
+    }
+    if main_modules[0] != unit.entry {
+        return Err(Diagnostic::type_error(
+            format!("`main` must be defined in entry module `{}`", unit.entry),
+            1,
+            1,
+        ));
+    }
+    let entry_exports = exports.get(&unit.entry).expect("entry exports");
+    validate_main_signature(&entry_exports.functions)
+}
+
+fn build_struct_layouts(
+    program: &Program,
+    implicit_pub: bool,
+) -> XResult<HashMap<String, StructLayout>> {
     let mut structs = HashMap::new();
     for struct_decl in &program.structs {
         let fields = struct_decl
@@ -853,12 +1067,24 @@ fn build_struct_layouts(program: &Program) -> XResult<HashMap<String, StructLayo
             .iter()
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
-        structs.insert(struct_decl.name.clone(), StructLayout { fields });
+        structs.insert(
+            struct_decl.name.clone(),
+            StructLayout {
+                fields,
+                pub_export: struct_decl.pub_export || implicit_pub,
+            },
+        );
     }
     Ok(structs)
 }
 
-fn validate_structs(program: &Program, layouts: &HashMap<String, StructLayout>) -> XResult<()> {
+fn validate_structs(
+    unit: &CompilationUnit,
+    module_name: &str,
+    program: &Program,
+    layouts: &HashMap<String, StructLayout>,
+    exports: &HashMap<String, ModuleExports>,
+) -> XResult<()> {
     let mut struct_names = HashSet::new();
     for struct_decl in &program.structs {
         if !struct_names.insert(struct_decl.name.clone()) {
@@ -886,17 +1112,28 @@ fn validate_structs(program: &Program, layouts: &HashMap<String, StructLayout>) 
                     field.name_span,
                 ));
             }
-            validate_struct_field_type(&struct_decl.name, &field.ty, field.ty_span, layouts)?;
+            validate_struct_field_type(
+                unit,
+                module_name,
+                &struct_decl.name,
+                &field.ty,
+                field.ty_span,
+                layouts,
+                exports,
+            )?;
         }
     }
     Ok(())
 }
 
 fn validate_struct_field_type(
+    unit: &CompilationUnit,
+    module_name: &str,
     struct_name: &str,
     ty: &TypeName,
     span: Span,
     layouts: &HashMap<String, StructLayout>,
+    exports: &HashMap<String, ModuleExports>,
 ) -> XResult<()> {
     match ty {
         TypeName::I32 | TypeName::Bool => Ok(()),
@@ -921,25 +1158,46 @@ fn validate_struct_field_type(
                 ))
             }
         }
+        TypeName::Qualified { module, name } => {
+            let module_exports = exports.get(module).ok_or_else(|| {
+                Diagnostic::type_error_at(format!("unknown module `{module}`"), span)
+            })?;
+            let layout = module_exports.structs.get(name).ok_or_else(|| {
+                Diagnostic::type_error_at(format!("unknown struct type `{module}.{name}`"), span)
+            })?;
+            if module != module_name && !layout.pub_export {
+                return Err(Diagnostic::type_error_at(
+                    format!("cannot use private struct `{name}` from module `{module}`"),
+                    span,
+                ));
+            }
+            if module != module_name
+                && !unit
+                    .modules
+                    .get(module_name)
+                    .map(|loaded| {
+                        loaded
+                            .program
+                            .imports
+                            .iter()
+                            .any(|import| import.name == *module)
+                    })
+                    .unwrap_or(false)
+            {
+                return Err(Diagnostic::type_error_at(
+                    format!("unknown module `{module}`"),
+                    span,
+                ));
+            }
+            Err(Diagnostic::type_error_at(
+                format!("nested struct field type `{module}.{name}` is not supported yet"),
+                span,
+            ))
+        }
         TypeName::Array { .. } => Err(Diagnostic::type_error_at(
             format!("array field types are not supported in struct `{struct_name}` yet"),
             span,
         )),
-    }
-}
-
-fn validate_struct_local_type(
-    layouts: &HashMap<String, StructLayout>,
-    name: &str,
-    span: Span,
-) -> XResult<()> {
-    if layouts.contains_key(name) {
-        Ok(())
-    } else {
-        Err(Diagnostic::type_error_at(
-            format!("unknown struct type `{name}`"),
-            span,
-        ))
     }
 }
 
@@ -951,7 +1209,11 @@ fn ensure_supported_signature_type(ty: &TypeName, span: Span) -> XResult<()> {
             span,
         )),
         TypeName::Named(name) => Err(Diagnostic::type_error_at(
-            format!("struct type `{name}` is parsed but not supported in function signatures yet"),
+            format!("struct type `{name}` is not supported in function signatures yet"),
+            span,
+        )),
+        TypeName::Qualified { module, name } => Err(Diagnostic::type_error_at(
+            format!("struct type `{module}.{name}` is not supported in function signatures yet"),
             span,
         )),
     }

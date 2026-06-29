@@ -2,7 +2,9 @@
 
 XLang is a systems programming language in early development — native performance, memory safety without a garbage collector, explicit semantics, and a path toward safe concurrency and GPU support.
 
-This repository holds the **v0.1 draft specification** (RFCs) and a **bootstrap MVP compiler** that lowers directly to LLVM IR.
+This repository holds the **language specification (RFCs)** and a **bootstrap MVP compiler** that lowers directly to LLVM IR.
+
+**Current milestone:** **v0.4** — real modules, imports, multi-file compilation, `pub`, and qualified names.
 
 ---
 
@@ -18,13 +20,20 @@ On Windows, set `LLVM_HOME` if LLVM is not installed at `C:\Program Files\LLVM`.
 
 ### Build and run the demo
 
+**Single-file (v0.1):**
+
 ```bash
 cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.1/main.x
 echo $?    # Linux/macOS — expect 42
 echo %ERRORLEVEL%  # Windows — expect 42
 ```
 
-The demo program adds `40 + 2` and returns `42` as the process exit code.
+**Multi-module (v0.4):**
+
+```bash
+cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.4/main.x
+echo %ERRORLEVEL%  # expect 42 (40 + 2 via math.add)
+```
 
 ### Install the CLI (optional)
 
@@ -40,44 +49,40 @@ cargo build --manifest-path compiler/Cargo.toml --release
 | Command | Description |
 |---------|-------------|
 | `check` | Lex, parse, and type-check — no codegen |
-| `emit-llvm` | Lower to LLVM IR, verify the module, print IR to stdout |
-| `build` | Write verified IR to `build/main.ll`, link with `clang` |
+| `emit-llvm` | Lower to LLVM IR, verify modules, print entry IR to stdout |
+| `build` | Write verified IR to `build/<module>.ll`, link with `clang` |
 | `run` | Build and execute the native binary |
 
 ```bash
-# via Cargo
-cargo run --manifest-path compiler/Cargo.toml -- check  examples/main.x
-cargo run --manifest-path compiler/Cargo.toml -- emit-llvm examples/main.x
-cargo run --manifest-path compiler/Cargo.toml -- build  examples/main.x
-cargo run --manifest-path compiler/Cargo.toml -- run    examples/main.x
-
-# after installing the `x` binary
-x check examples/main.x
-x emit-llvm examples/main.x --target x86_64-pc-windows-msvc
-x build examples/main.x
-x run examples/main.x
+cargo run --manifest-path compiler/Cargo.toml -- check  examples/v0.4/main.x
+cargo run --manifest-path compiler/Cargo.toml -- emit-llvm examples/v0.4/main.x
+cargo run --manifest-path compiler/Cargo.toml -- build  examples/v0.4/main.x
+cargo run --manifest-path compiler/Cargo.toml -- run    examples/v0.4/main.x
 ```
 
-**Target triple:** pass `--target <triple>` or set `XLANG_TARGET_TRIPLE`. When unset, the backend picks a known host triple where supported.
+**Target triple:** pass `--target <triple>` or set `XLANG_TARGET_TRIPLE`.
 
-**Output paths:** `build/main.ll` and `build/main.exe` (or `build/main` on Unix).
+**Output paths:** `build/<module>.ll` for each compiled module; `build/main.exe` (or `build/main`) for the linked binary.
 
 ---
 
-## Language subset (MVP)
-
-What works today:
+## Language subset (current)
 
 ```xlang
 module main
-
-i32 add(i32 a, i32 b) {
-    return a + b;
-}
+import math
 
 i32 main() {
-    i32 x = add(40, 2);
-    return x;
+    return math.add(40, 2);
+}
+```
+
+```xlang
+// math.x
+module math
+
+pub i32 add(i32 a, i32 b) {
+    return a + b;
 }
 ```
 
@@ -85,20 +90,21 @@ i32 main() {
 |---------|:--------:|:------------:|
 | `i32`, `bool`, `void` | yes | yes |
 | Functions, calls, `return` | yes | yes |
-| C-style local declarations, `const`, assignments | yes | yes |
-| `if` / `else` | yes | yes |
-| Arithmetic, comparison, `&&`, `\|\|` | yes | yes |
-| `module`, `import` (syntax only) | parsed | — |
-| `struct` declarations | parsed | — |
+| C-style locals, `const`, assignments | yes | yes |
+| `if` / `else`, `while`, `break`, `continue` | yes | yes |
+| Fixed-size stack arrays | yes | yes |
+| Structs, literals, field access / assign | yes | yes |
+| `module`, `import`, multi-file | yes | yes |
+| `pub`, qualified names (`math.add`) | yes | yes |
 | `str` literals | type-checked | rejected at codegen |
 
-Rules that matter in v0.1:
+Rules that matter:
 
-- Executable statements end with `;` (newlines do not terminate statements).
-- Functions use C-style syntax: `return_type name(type param, …) { … }` (e.g. `i32 add(i32 a, i32 b)`).
-- `main` must be `i32 main()` with no parameters.
-- Local declarations use C-style syntax: `i32 x = 1;` creates a mutable local; `const i32 x = 1;` creates an immutable local.
-- The backend uses direct LLVM lowering through [Inkwell 0.9](https://github.com/TheDan64/inkwell) (LLVM 22.1). There is **no C backend** and no C-as-IR stage.
+- Executable statements end with `;`.
+- Functions: `return_type name(type param, …) { … }`.
+- `main` must be `i32 main()` in the **entry module** only.
+- Cross-module symbols require `pub`; imports do not re-export.
+- LLVM mangling: `@xlang.<module>.<fn>`, entry `@main` unmangled.
 
 ---
 
@@ -109,20 +115,18 @@ XLang/
 ├── compiler/           Bootstrap compiler (Rust crate `x`)
 ├── LSP/                Experimental language server + VS Code extension
 ├── docs/
-│   ├── releases/       Release notes (v0.1.md)
-│   ├── spec/           Language reference (v0.1-language-reference.md)
-│   ├── compiler/       Compiler architecture (v0.1-architecture.md)
-│   └── rfcs/           Long-term specification drafts
+│   ├── releases/       Release notes (v0.1–v0.4)
+│   ├── spec/           Language reference
+│   ├── compiler/       Compiler architecture
+│   └── rfcs/           Specification drafts
 ├── examples/
-│   └── v0.1/           Canonical v0.1 sample programs
+│   ├── v0.1/ … v0.4/   Versioned sample programs
 └── build/              Generated IR and binaries (gitignored)
 ```
 
-**v0.1 docs:** [release notes](docs/releases/v0.1.md) · [language reference](docs/spec/v0.1-language-reference.md) · [compiler architecture](docs/compiler/v0.1-architecture.md)
+**Release notes:** [v0.1](docs/releases/v0.1.md) · [v0.2](docs/releases/v0.2.md) · [v0.3](docs/releases/v0.3.md) · [v0.4](docs/releases/v0.4.md)
 
-**v0.2 docs:** [release notes](docs/releases/v0.2.md) · [RFC-0014–0017](docs/rfcs/RFC-0014-v0-2-roadmap-and-scope.md) · [examples/v0.2/](examples/v0.2/)
-
-**v0.3 docs:** [release notes](docs/releases/v0.3.md) · [RFC-0018–0022](docs/rfcs/RFC-0018-v0-3-roadmap-and-scope.md) · [examples/v0.3/](examples/v0.3/)
+**Examples:** [v0.4 multi-module](examples/v0.4/)
 
 ---
 
@@ -131,48 +135,32 @@ XLang/
 | RFC | Title |
 |-----|-------|
 | [RFC-0001](docs/rfcs/RFC-0001-vision-philosophy-and-non-goals.md) | Vision, philosophy, and non-goals |
-| [RFC-0002](docs/rfcs/RFC-0002-syntax-principles.md) | Syntax principles |
-| [RFC-0003](docs/rfcs/RFC-0003-mvp-compiler-roadmap.md) | MVP compiler roadmap |
-| [RFC-0004](docs/rfcs/RFC-0004-lexical-grammar.md) | Lexical grammar |
-| [RFC-0005](docs/rfcs/RFC-0005-concrete-grammar-ebnf.md) | Concrete grammar (EBNF) |
-| [RFC-0006](docs/rfcs/RFC-0006-llvm-ir-lowering-rules.md) | LLVM IR lowering rules |
-| [RFC-0007](docs/rfcs/RFC-0007-variables-mutability-and-assignment.md) | Variables, mutability, and assignment |
-| [RFC-0008](docs/rfcs/RFC-0008-primitive-types.md) | Primitive types |
-| [RFC-0009](docs/rfcs/RFC-0009-expressions-and-operator-precedence.md) | Expressions and operator precedence |
-| [RFC-0010](docs/rfcs/RFC-0010-statements-and-blocks.md) | Statements and blocks |
-| [RFC-0011](docs/rfcs/RFC-0011-functions-and-calling-conventions.md) | Functions and calling conventions |
-| [RFC-0012](docs/rfcs/RFC-0012-modules-and-imports.md) | Modules and imports |
-| [RFC-0013](docs/rfcs/RFC-0013-diagnostics-and-error-codes.md) | Diagnostics and error codes |
-| [RFC-0014](docs/rfcs/RFC-0014-v0-2-roadmap-and-scope.md) | v0.2 roadmap and scope |
-| [RFC-0015](docs/rfcs/RFC-0015-while-loops-break-and-continue.md) | While loops, break, continue |
-| [RFC-0016](docs/rfcs/RFC-0016-fixed-size-arrays.md) | Fixed-size stack arrays |
-| [RFC-0017](docs/rfcs/RFC-0017-index-expressions-and-bounds-checking.md) | Index expressions and bounds checking |
-| [RFC-0018](docs/rfcs/RFC-0018-v0-3-roadmap-and-scope.md) | v0.3 roadmap and scope (structs) |
-| [RFC-0019](docs/rfcs/RFC-0019-struct-layout-and-declarations.md) | Struct layout and declarations |
-| [RFC-0020](docs/rfcs/RFC-0020-struct-literals-and-construction.md) | Struct literals and construction |
-| [RFC-0021](docs/rfcs/RFC-0021-field-access-and-assignment.md) | Field access and assignment |
-| [RFC-0022](docs/rfcs/RFC-0022-llvm-struct-lowering.md) | LLVM struct lowering |
+| … | … |
+| [RFC-0023](docs/rfcs/RFC-0023-v0-4-roadmap-and-scope.md) | v0.4 roadmap and scope (modules) |
+| [RFC-0024](docs/rfcs/RFC-0024-module-identity-and-source-layout.md) | Module identity and source layout |
+| [RFC-0025](docs/rfcs/RFC-0025-import-resolution.md) | Import resolution |
+| [RFC-0026](docs/rfcs/RFC-0026-cross-module-name-resolution.md) | Cross-module name resolution |
+| [RFC-0027](docs/rfcs/RFC-0027-public-and-private-symbols.md) | Public and private symbols |
+| [RFC-0028](docs/rfcs/RFC-0028-multi-file-compilation.md) | Multi-file compilation |
+| [RFC-0029](docs/rfcs/RFC-0029-llvm-linking-and-symbol-names.md) | LLVM linking and symbol names |
+| [RFC-0030](docs/rfcs/RFC-0030-v0-4-diagnostics.md) | v0.4 diagnostics |
 
-All RFCs are currently **Draft**.
+Full RFC index in previous README sections; all RFCs are **Draft** unless noted in release notes.
 
 ---
 
 ## Development
 
 ```bash
-# run the test suite (unit tests: lexer, parser, typeck, LLVM snapshots, diagnostics)
 cargo test --manifest-path compiler/Cargo.toml
 ```
 
-Engineering constraints for the MVP:
+Engineering constraints:
 
 - Deterministic diagnostics with source spans
-- `Module::verify()` gate before any IR is printed, written, or linked
+- `Module::verify()` per IR unit before link
 - LLVM IR snapshot tests with pinned target triples
-- No generated C artifacts in the backend path
-- CI runs formatting, clippy with warnings denied, and the Rust test suite
-
-On Windows, `compiler/src/llvm_windows_shim.rs` provides stub symbols for LLVM target initialization entry points missing from the official Windows LLVM installer layout.
+- No C backend; direct Inkwell lowering (LLVM 22)
 
 ---
 
@@ -180,8 +168,8 @@ On Windows, `compiler/src/llvm_windows_shim.rs` provides stub symbols for LLVM t
 
 1. ~~Minimal grammar and bootstrap compiler~~
 2. ~~v0.2: loops and fixed-size arrays~~
-3. ~~**v0.3:** struct layout, literals, field access, LLVM lowering~~
-4. Module system and imports
+3. ~~v0.3: structs~~
+4. ~~**v0.4:** modules, imports, multi-file, `pub`, qualified names~~
 5. Ownership, borrowing, and error values
 6. Concurrency and GPU support
 

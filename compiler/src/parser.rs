@@ -1,5 +1,6 @@
 use crate::ast::{
-    BinaryOp, Expr, Field, Function, Param, Program, Stmt, StructDecl, TypeName, UnaryOp,
+    BinaryOp, Expr, Field, Function, Import, Param, Program, Stmt, StructDecl, TypeName,
+    UnaryOp,
 };
 use crate::diagnostic::{Diagnostic, XResult};
 use crate::token::{Keyword, Token, TokenKind};
@@ -27,7 +28,9 @@ impl Parser {
 
         let mut imports = Vec::new();
         while self.match_keyword(Keyword::Import) {
-            imports.push(self.expect_identifier("expected import name")?);
+            let (name, span) =
+                self.expect_identifier_with_span("expected import name")?;
+            imports.push(Import { name, span });
         }
 
         let mut structs = Vec::new();
@@ -49,6 +52,7 @@ impl Parser {
     }
 
     fn parse_struct(&mut self) -> XResult<StructDecl> {
+        let pub_export = self.parse_visibility();
         self.expect_keyword(Keyword::Struct, "expected `struct` declaration")?;
         let (name, name_span) = self.expect_identifier_with_span("expected struct name")?;
         self.expect(TokenKind::LeftBrace, "expected `{` after struct name")?;
@@ -66,6 +70,7 @@ impl Parser {
         }
         self.expect(TokenKind::RightBrace, "expected `}` after struct body")?;
         Ok(StructDecl {
+            pub_export,
             name,
             name_span,
             fields,
@@ -73,6 +78,7 @@ impl Parser {
     }
 
     fn parse_function(&mut self) -> XResult<Function> {
+        let pub_export = self.parse_visibility();
         let (return_type, return_type_span) = self.parse_type_with_span()?;
         let (name, name_span) = self.expect_identifier_with_span("expected function name")?;
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
@@ -96,6 +102,7 @@ impl Parser {
         self.expect(TokenKind::RightParen, "expected `)` after parameters")?;
         let body = self.parse_block()?;
         Ok(Function {
+            pub_export,
             name,
             name_span,
             params,
@@ -103,6 +110,10 @@ impl Parser {
             return_type_span: Some(return_type_span),
             body,
         })
+    }
+
+    fn parse_visibility(&mut self) -> bool {
+        self.match_keyword(Keyword::Pub)
     }
 
     fn parse_block(&mut self) -> XResult<Vec<Stmt>> {
@@ -304,6 +315,17 @@ impl Parser {
                 "bool" => Ok((TypeName::Bool, token.span)),
                 "str" => Ok((TypeName::Str, token.span)),
                 "void" => Ok((TypeName::Void, token.span)),
+                _ if self.match_token(&TokenKind::Dot) => {
+                    let (struct_name, name_span) =
+                        self.expect_identifier_with_span("expected struct name after `.`")?;
+                    Ok((
+                        TypeName::Qualified {
+                            module: name,
+                            name: struct_name,
+                        },
+                        token.span.join(name_span),
+                    ))
+                }
                 _ => Ok((TypeName::Named(name), token.span)),
             },
             _ => Err(Diagnostic::parse(
@@ -539,6 +561,31 @@ impl Parser {
                         args,
                         span: token.span.join(end),
                     })
+                } else if self.peek_qualified_call() {
+                    self.advance();
+                    let (callee, callee_span) =
+                        self.expect_identifier_with_span("expected function name after `.`")?;
+                    self.expect(
+                        TokenKind::LeftParen,
+                        "expected `(` after qualified function name",
+                    )?;
+                    let mut args = Vec::new();
+                    if !self.check(&TokenKind::RightParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if !self.match_token(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    let end = self.current().span;
+                    self.expect(TokenKind::RightParen, "expected `)` after arguments")?;
+                    Ok(Expr::QualifiedCall {
+                        module: name,
+                        callee,
+                        args,
+                        span: token.span.join(callee_span).join(end),
+                    })
                 } else {
                     Ok(Expr::Variable {
                         name,
@@ -652,6 +699,16 @@ impl Parser {
         matches!(self.current().kind, TokenKind::Eof)
     }
 
+    fn peek_qualified_call(&self) -> bool {
+        if !self.check(&TokenKind::Dot) {
+            return false;
+        }
+        let callee = self.tokens.get(self.index + 1).map(|token| &token.kind);
+        let after = self.tokens.get(self.index + 2).map(|token| &token.kind);
+        matches!(callee, Some(TokenKind::Identifier(_)))
+            && matches!(after, Some(TokenKind::LeftParen))
+    }
+
     fn peek_identifier(&self) -> Option<(String, crate::diagnostic::Span)> {
         match &self.current().kind {
             TokenKind::Identifier(name) => Some((name.clone(), self.current().span)),
@@ -670,6 +727,18 @@ impl Parser {
         let TokenKind::Identifier(name) = &self.current().kind else {
             return false;
         };
+        if self.peek_next_kind_is(&TokenKind::Dot) {
+            return self
+                .tokens
+                .get(self.index + 2)
+                .map(|token| matches!(token.kind, TokenKind::Identifier(_)))
+                .unwrap_or(false)
+                && self
+                    .tokens
+                    .get(self.index + 3)
+                    .map(|token| matches!(token.kind, TokenKind::Identifier(_)))
+                    .unwrap_or(false);
+        }
         match self.tokens.get(self.index + 1).map(|token| &token.kind) {
             Some(TokenKind::Identifier(_)) => true,
             Some(TokenKind::LeftBracket) => Self::is_type_name_spelling(name),
