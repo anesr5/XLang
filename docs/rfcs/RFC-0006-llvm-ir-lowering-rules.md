@@ -503,3 +503,62 @@ Add snapshots for:
 - compile-time rejection paths (negative tests — see RFC-0013 § v0.2)
 
 Pin target triple and normalize trap block names in snapshots where needed.
+
+---
+
+## v0.3 Additions (Draft — RFC-0018 through RFC-0022)
+
+This section summarizes LLVM lowering for **struct values** in v0.3. Authoritative detail is in [RFC-0022](RFC-0022-llvm-struct-lowering.md).
+
+### v0.3 Struct Type Definitions
+
+Each declared struct `S` with scalar fields lowers to a named LLVM struct:
+
+```llvm
+%S = type { … field llvm types in declaration order … }
+```
+
+Emit struct type definitions before function bodies in the module.
+
+### v0.3 Struct Local Storage
+
+Struct locals use `alloca %S` (pointer to struct). The environment stores the alloca pointer, same as scalars and arrays.
+
+Struct literals initialize fields with per-field `getelementptr` + `store` (see RFC-0022 §5).
+
+### v0.3 Field Access Lowering
+
+Field read `p.field`:
+
+```llvm
+%gep = getelementptr inbounds %S, ptr %p, i32 0, i32 field_index
+%val = load field_llvm_type, ptr %gep
+```
+
+Field assign `p.field = expr`:
+
+```llvm
+%gep = getelementptr inbounds %S, ptr %p, i32 0, i32 field_index
+store field_value, ptr %gep
+```
+
+`field_index` is resolved at compile time from the layout table (RFC-0019).
+
+### v0.3 Unsupported Backend Paths
+
+Reject with `E0300`:
+
+- struct fields of type `str`, nested struct, or array
+- struct-typed function parameters or returns
+- arrays of structs
+
+### v0.3 Snapshot Tests
+
+Add snapshots for:
+
+- struct type definition in module
+- struct literal field stores
+- field load and field assign
+- combined struct + loop example (e.g. increment struct field in `while`)
+
+See RFC-0013 § v0.3 for negative test requirements.
