@@ -28,8 +28,7 @@ impl Parser {
 
         let mut imports = Vec::new();
         while self.match_keyword(Keyword::Import) {
-            let (name, span) =
-                self.expect_identifier_with_span("expected import name")?;
+            let (name, span) = self.expect_identifier_with_span("expected import name")?;
             imports.push(Import { name, span });
         }
 
@@ -37,9 +36,9 @@ impl Parser {
         let mut enums = Vec::new();
         let mut functions = Vec::new();
         while !self.is_at_end() {
-            if self.check_keyword(Keyword::Struct) {
+            if self.upcoming_keyword(Keyword::Struct) {
                 structs.push(self.parse_struct()?);
-            } else if self.check_keyword(Keyword::Enum) {
+            } else if self.upcoming_keyword(Keyword::Enum) {
                 enums.push(self.parse_enum()?);
             } else {
                 functions.push(self.parse_function()?);
@@ -161,6 +160,20 @@ impl Parser {
 
     fn parse_visibility(&mut self) -> bool {
         self.match_keyword(Keyword::Pub)
+    }
+
+    fn upcoming_keyword(&self, keyword: Keyword) -> bool {
+        let mut index = self.index;
+        if matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Keyword(Keyword::Pub))
+        ) {
+            index += 1;
+        }
+        matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Keyword(k)) if *k == keyword
+        )
     }
 
     fn parse_block(&mut self) -> XResult<Vec<Stmt>> {
@@ -292,10 +305,7 @@ impl Parser {
         let (annotation, annotation_span) = self.parse_type_with_span()?;
         let (name, name_span) = self.expect_identifier_with_span(name_message)?;
         self.expect(TokenKind::Equal, "expected `=` in binding")?;
-        let value = if matches!(
-            annotation,
-            TypeName::Named(_) | TypeName::Qualified { .. }
-        ) {
+        let value = if matches!(annotation, TypeName::Named(_) | TypeName::Qualified { .. }) {
             if self.check(&TokenKind::LeftBrace) {
                 self.parse_struct_literal()?
             } else {

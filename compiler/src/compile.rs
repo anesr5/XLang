@@ -85,7 +85,11 @@ pub fn build_with_options(file: &Path, options: &CompileOptions) -> XResult<Path
     for (module_name, ir) in &modules {
         let ir_path = build_dir.join(format!("{module_name}.ll"));
         fs::write(&ir_path, ir).map_err(|err| {
-            Diagnostic::io(format!("failed to write LLVM IR for `{module_name}`: {err}"), 1, 1)
+            Diagnostic::io(
+                format!("failed to write LLVM IR for `{module_name}`: {err}"),
+                1,
+                1,
+            )
         })?;
         ir_paths.push(ir_path);
     }

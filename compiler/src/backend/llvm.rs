@@ -126,6 +126,7 @@ struct FunctionEmitter<'emit, 'ctx, 'unit> {
     struct_types: &'emit HashMap<String, StructType<'ctx>>,
     enum_types: &'emit HashMap<String, StructType<'ctx>>,
     locals: HashMap<String, Local<'ctx>>,
+    function_return_type: TypeName,
     loop_stack: Vec<LoopLabels<'ctx>>,
     terminated: bool,
 }
@@ -201,6 +202,18 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             let Some(target_fn) = target.program.functions.iter().find(|f| f.name == callee) else {
                 continue;
             };
+            ensure_declared_enum_types_for_signature(
+                self.context,
+                self.unit,
+                &import_module,
+                &mut self.enum_types,
+                &target_fn.return_type,
+                &target_fn
+                    .params
+                    .iter()
+                    .map(|param| param.ty.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             let symbol = mangle_function(&import_module, &callee, false);
             if self.functions.contains_key(&symbol) {
                 continue;
@@ -208,11 +221,27 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             let params = target_fn
                 .params
                 .iter()
-                .map(|param| llvm_basic_type(self.context, &param.ty).map(Into::into))
+                .map(|param| {
+                    llvm_basic_type(
+                        self.context,
+                        &self.enum_types,
+                        self.unit,
+                        &import_module,
+                        &param.ty,
+                    )
+                    .map(Into::into)
+                })
                 .collect::<XResult<Vec<BasicMetadataTypeEnum<'ctx>>>>()?;
             let function_type = match target_fn.return_type {
                 TypeName::Void => self.context.void_type().fn_type(&params, false),
-                _ => llvm_basic_type(self.context, &target_fn.return_type)?.fn_type(&params, false),
+                _ => llvm_basic_type(
+                    self.context,
+                    &self.enum_types,
+                    self.unit,
+                    &import_module,
+                    &target_fn.return_type,
+                )?
+                .fn_type(&params, false),
             };
             let function_value = self.module.add_function(&symbol, function_type, None);
             self.functions.insert(symbol, function_value);
@@ -234,12 +263,19 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             }
         }
         for function in &self.program.functions {
-            ensure_backend_type(
+            ensure_backend_signature_type(
+                self.unit,
+                self.module_name,
                 &function.return_type,
                 function.return_type_span.unwrap_or(function.name_span),
             )?;
             for param in &function.params {
-                ensure_backend_type(&param.ty, param.ty_span)?;
+                ensure_backend_signature_type(
+                    self.unit,
+                    self.module_name,
+                    &param.ty,
+                    param.ty_span,
+                )?;
             }
             for stmt in &function.body {
                 ensure_stmt_supported(self.unit, self.module_name, stmt)?;
@@ -253,16 +289,19 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
         for struct_decl in &self.program.structs {
             struct_keys.insert(struct_ir_name(self.module_name, &struct_decl.name));
         }
-        collect_referenced_struct_types(self.unit, self.program, self.module_name, &mut struct_keys);
+        collect_referenced_struct_types(
+            self.unit,
+            self.program,
+            self.module_name,
+            &mut struct_keys,
+        );
         for key in struct_keys {
             let (owner_module, struct_name) = key
                 .split_once('.')
                 .ok_or_else(|| Diagnostic::backend(format!("invalid struct key `{key}`"), 1, 1))?;
-            let owner = self
-                .unit
-                .modules
-                .get(owner_module)
-                .ok_or_else(|| Diagnostic::backend(format!("unknown module `{owner_module}`"), 1, 1))?;
+            let owner = self.unit.modules.get(owner_module).ok_or_else(|| {
+                Diagnostic::backend(format!("unknown module `{owner_module}`"), 1, 1)
+            })?;
             let struct_decl = owner
                 .program
                 .structs
@@ -290,6 +329,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             enum_keys.insert(enum_ir_name(self.module_name, &enum_decl.name));
         }
         collect_referenced_enum_types(self.unit, self.program, self.module_name, &mut enum_keys);
+        collect_enum_types_in_signatures(self.unit, self.program, self.module_name, &mut enum_keys);
         let i32 = self.context.i32_type();
         for key in enum_keys {
             let enum_type = self
@@ -307,11 +347,27 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             let params = function
                 .params
                 .iter()
-                .map(|param| llvm_basic_type(self.context, &param.ty).map(Into::into))
+                .map(|param| {
+                    llvm_basic_type(
+                        self.context,
+                        &self.enum_types,
+                        self.unit,
+                        self.module_name,
+                        &param.ty,
+                    )
+                    .map(Into::into)
+                })
                 .collect::<XResult<Vec<BasicMetadataTypeEnum<'ctx>>>>()?;
             let function_type = match function.return_type {
                 TypeName::Void => self.context.void_type().fn_type(&params, false),
-                _ => llvm_basic_type(self.context, &function.return_type)?.fn_type(&params, false),
+                _ => llvm_basic_type(
+                    self.context,
+                    &self.enum_types,
+                    self.unit,
+                    self.module_name,
+                    &function.return_type,
+                )?
+                .fn_type(&params, false),
             };
             let symbol = mangle_function(self.module_name, &function.name, self.is_entry);
             let function_value = self.module.add_function(&symbol, function_type, None);
@@ -326,9 +382,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             .functions
             .get(&symbol)
             .copied()
-            .ok_or_else(|| {
-                Diagnostic::backend(format!("unknown function `{symbol}`"), 1, 1)
-            })?;
+            .ok_or_else(|| Diagnostic::backend(format!("unknown function `{symbol}`"), 1, 1))?;
         let entry = self.context.append_basic_block(function_value, "entry");
         self.builder.position_at_end(entry);
 
@@ -343,6 +397,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             struct_types: &self.struct_types,
             enum_types: &self.enum_types,
             locals: HashMap::new(),
+            function_return_type: function.return_type.clone(),
             loop_stack: Vec::new(),
             terminated: false,
         };
@@ -352,20 +407,39 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 .get_nth_param(index as u32)
                 .ok_or_else(|| Diagnostic::backend("missing LLVM function parameter", 1, 1))?;
             value.set_name(&param.name);
-            let ty = value.get_type();
-            let slot = build_value(
-                self.builder
-                    .build_alloca(ty, &format!("{}.addr", param.name)),
-            )?;
-            build_unit(self.builder.build_store(slot, value))?;
-            emitter.locals.insert(
-                param.name.clone(),
-                Local {
-                    pointer: slot,
-                    ty: param.ty.clone(),
-                    scalar_ty: Some(ty),
-                },
-            );
+            if let Some(enum_key) = enum_key_from_type(self.module_name, &param.ty)
+                && self.enum_types.contains_key(&enum_key)
+            {
+                let enum_ty = self.enum_types.get(&enum_key).copied().expect("enum type");
+                let slot = build_value(
+                    self.builder
+                        .build_alloca(enum_ty, &format!("{}.addr", param.name)),
+                )?;
+                build_unit(self.builder.build_store(slot, value))?;
+                emitter.locals.insert(
+                    param.name.clone(),
+                    Local {
+                        pointer: slot,
+                        ty: param.ty.clone(),
+                        scalar_ty: None,
+                    },
+                );
+            } else {
+                let ty = value.get_type();
+                let slot = build_value(
+                    self.builder
+                        .build_alloca(ty, &format!("{}.addr", param.name)),
+                )?;
+                build_unit(self.builder.build_store(slot, value))?;
+                emitter.locals.insert(
+                    param.name.clone(),
+                    Local {
+                        pointer: slot,
+                        ty: param.ty.clone(),
+                        scalar_ty: Some(ty),
+                    },
+                );
+            }
         }
 
         for stmt in &function.body {
@@ -424,13 +498,23 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                 if let Some(enum_ref) = annotation.as_ref().and_then(TypeName::enum_ref) {
                     let ir_key = enum_key_from_ref(self.module_name, enum_ref);
                     if self.enum_types.contains_key(&ir_key) {
-                        self.emit_enum_binding(
-                            name,
-                            &ir_key,
-                            annotation.as_ref().unwrap(),
-                            value,
-                            source_span,
-                        )?;
+                        if self.is_enum_constructor_value(value, &ir_key) {
+                            self.emit_enum_binding(
+                                name,
+                                &ir_key,
+                                annotation.as_ref().unwrap(),
+                                value,
+                                source_span,
+                            )?;
+                        } else {
+                            self.emit_enum_from_expr(
+                                name,
+                                &ir_key,
+                                annotation.as_ref().unwrap(),
+                                value,
+                                source_span,
+                            )?;
+                        }
                         return Ok(());
                     }
                 }
@@ -507,8 +591,8 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                             value.span(),
                         ));
                     }
-                    let struct_key = struct_key_from_type(self.module_name, &local.ty)
-                        .expect("struct key");
+                    let struct_key =
+                        struct_key_from_type(self.module_name, &local.ty).expect("struct key");
                     (local.pointer, struct_key)
                 };
                 let field_index = struct_field_index_for_unit(self.unit, &struct_key, field)?;
@@ -727,6 +811,99 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
         Ok(())
     }
 
+    fn is_enum_constructor_value(&self, value: &Expr, enum_key: &str) -> bool {
+        let Expr::Call { callee, .. } = value else {
+            return false;
+        };
+        enum_decl_for_key(self.unit, enum_key)
+            .ok()
+            .is_some_and(|decl| decl.variants.iter().any(|variant| variant.name == *callee))
+    }
+
+    fn emit_enum_from_expr(
+        &mut self,
+        name: &str,
+        enum_key: &str,
+        bound_ty: &TypeName,
+        value: &Expr,
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<()> {
+        let enum_ty = self.enum_types.get(enum_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown enum type `{enum_key}`"), source_span)
+        })?;
+        let rendered = self.emit_expr(value)?;
+        let Some(rendered) = rendered else {
+            return Err(Diagnostic::backend_at(
+                "cannot bind void value to enum local",
+                source_span,
+            ));
+        };
+        let slot = build_value(self.builder.build_alloca(*enum_ty, name))?;
+        build_unit(self.builder.build_store(slot, rendered))?;
+        self.locals.insert(
+            name.to_owned(),
+            Local {
+                pointer: slot,
+                ty: bound_ty.clone(),
+                scalar_ty: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn emit_enum_constructor_value(
+        &mut self,
+        enum_key: &str,
+        callee: &str,
+        args: &[Expr],
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<Option<BasicValueEnum<'ctx>>> {
+        let enum_ty = *self.enum_types.get(enum_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown enum type `{enum_key}`"), source_span)
+        })?;
+        let enum_decl = enum_decl_for_key(self.unit, enum_key)?;
+        let tag_index = variant_tag_index(enum_decl, callee)?;
+        let payload_ty = variant_payload_type(enum_decl, callee)?;
+        let i32 = self.context.i32_type();
+        let tag_value = i32.const_int(tag_index as u64, false);
+        let payload_value = if let Some(payload_ty) = payload_ty {
+            if args.len() != 1 {
+                return Err(Diagnostic::backend_at(
+                    format!("constructor `{callee}` expects 1 argument"),
+                    source_span,
+                ));
+            }
+            let rendered = self.emit_expr(&args[0])?;
+            let Some(rendered) = rendered else {
+                return Err(Diagnostic::backend_at(
+                    "cannot initialize enum with void value",
+                    args[0].span(),
+                ));
+            };
+            match payload_ty {
+                TypeName::I32 => rendered.into_int_value(),
+                TypeName::Bool => build_value(self.builder.build_int_z_extend(
+                    rendered.into_int_value(),
+                    i32,
+                    "enum.payload.zext",
+                ))?,
+                _ => return Err(unsupported_backend_type(source_span)),
+            }
+        } else {
+            if !args.is_empty() {
+                return Err(Diagnostic::backend_at(
+                    format!("constructor `{callee}` expects 0 arguments"),
+                    source_span,
+                ));
+            }
+            i32.const_int(0, false)
+        };
+        Ok(Some(
+            build_enum_value(self.builder, enum_ty, tag_value, payload_value)?
+                .as_basic_value_enum(),
+        ))
+    }
+
     fn emit_enum_binding(
         &mut self,
         name: &str,
@@ -784,12 +961,7 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
             }
             i32.const_int(0, false)
         };
-        let aggregate = build_enum_value(
-            self.builder,
-            *enum_ty,
-            tag_value,
-            payload_value,
-        )?;
+        let aggregate = build_enum_value(self.builder, *enum_ty, tag_value, payload_value)?;
         let slot = build_value(self.builder.build_alloca(*enum_ty, name))?;
         build_unit(self.builder.build_store(slot, aggregate))?;
         self.locals.insert(
@@ -971,6 +1143,19 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                 let local = self.locals.get(name).ok_or_else(|| {
                     Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
                 })?;
+                if local.ty.enum_ref().is_some_and(|enum_ref| {
+                    let key = enum_key_from_ref(self.module_name, enum_ref);
+                    self.enum_types.contains_key(&key)
+                }) {
+                    let enum_key =
+                        enum_key_from_type(self.module_name, &local.ty).expect("enum key");
+                    let enum_ty = *self.enum_types.get(&enum_key).expect("enum type");
+                    return Ok(Some(build_value(self.builder.build_load(
+                        enum_ty,
+                        local.pointer,
+                        &format!("{name}.load"),
+                    ))?));
+                }
                 let Some(scalar_ty) = local.scalar_ty else {
                     if local.ty.array_elem_len().is_some() {
                         return Err(Diagnostic::backend_at(
@@ -998,22 +1183,41 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                     &format!("{name}.load"),
                 ))?))
             }
-            Expr::Call { callee, args, .. } => self.emit_call(
-                &mangle_function(
-                    self.module_name,
-                    callee,
-                    self.module_name == self.unit.entry && callee == "main",
-                ),
-                args,
-                false,
-            ),
+            Expr::Call { callee, args, span } => {
+                if let Some(enum_ref) = self.function_return_type.enum_ref() {
+                    let enum_key = enum_key_from_ref(self.module_name, enum_ref);
+                    if self.is_enum_constructor_value(
+                        &Expr::Call {
+                            callee: callee.clone(),
+                            args: args.to_vec(),
+                            span: *span,
+                        },
+                        &enum_key,
+                    ) {
+                        return self.emit_enum_constructor_value(&enum_key, callee, args, *span);
+                    }
+                }
+                self.emit_call(
+                    &mangle_function(
+                        self.module_name,
+                        callee,
+                        self.module_name == self.unit.entry && callee == "main",
+                    ),
+                    args,
+                    false,
+                )
+            }
             Expr::QualifiedCall {
                 module,
                 callee,
                 args,
                 ..
             } => self.emit_call(
-                &mangle_function(module, callee, module == &self.unit.entry && callee == "main"),
+                &mangle_function(
+                    module,
+                    callee,
+                    module == &self.unit.entry && callee == "main",
+                ),
                 args,
                 true,
             ),
@@ -1063,7 +1267,7 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                 self.emit_bounds_check(index_value, len, index.span())?;
                 let elem_ptr =
                     self.emit_array_element_ptr(array_ptr, &elem_ty, len, index_value)?;
-                let scalar_ty = llvm_basic_type(self.context, &elem_ty)?;
+                let scalar_ty = llvm_scalar_type(self.context, &elem_ty, index.span())?;
                 Ok(Some(build_value(self.builder.build_load(
                     scalar_ty,
                     elem_ptr,
@@ -1109,8 +1313,8 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                             *field_span,
                         ));
                     }
-                    let struct_key = struct_key_from_type(self.module_name, &local.ty)
-                        .expect("struct key");
+                    let struct_key =
+                        struct_key_from_type(self.module_name, &local.ty).expect("struct key");
                     (local.pointer, struct_key)
                 };
                 let field_index = struct_field_index_for_unit(self.unit, &struct_key, field)?;
@@ -1137,41 +1341,20 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
         arms: &[MatchArm],
         span: crate::diagnostic::Span,
     ) -> XResult<Option<BasicValueEnum<'ctx>>> {
-        let Expr::Variable { name, span: var_span } = scrutinee else {
-            return Err(Diagnostic::backend_at(
-                "match scrutinee must be an enum local variable",
-                scrutinee.span(),
-            ));
-        };
-        let (enum_key, enum_ty) = {
-            let local = self.locals.get(name).ok_or_else(|| {
-                Diagnostic::backend_at(format!("unknown variable `{name}`"), *var_span)
-            })?;
-            let enum_key = enum_key_from_type(self.module_name, &local.ty).ok_or_else(|| {
-                Diagnostic::backend_at("match scrutinee must be an enum type", *var_span)
-            })?;
-            let enum_ty = *self.enum_types.get(&enum_key).ok_or_else(|| {
-                Diagnostic::backend_at(format!("unknown enum type `{enum_key}`"), span)
-            })?;
-            (enum_key, enum_ty)
-        };
+        let scrutinee_ty = self.type_name_for_scrutinee(scrutinee)?;
+        let enum_key = enum_key_from_type(self.module_name, &scrutinee_ty).ok_or_else(|| {
+            Diagnostic::backend_at("match scrutinee must be an enum type", scrutinee.span())
+        })?;
+        let enum_ty = *self.enum_types.get(&enum_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown enum type `{enum_key}`"), span)
+        })?;
         let enum_decl = enum_decl_for_key(self.unit, &enum_key)?;
-        let loaded = build_value(self.builder.build_load(
-            enum_ty,
-            self.locals[name].pointer,
-            "match.load",
-        ))?
-        .into_struct_value();
-        let tag = build_value(
-            self.builder
-                .build_extract_value(loaded, 0, "match.tag"),
-        )?
-        .into_int_value();
-        let payload_raw = build_value(
-            self.builder
-                .build_extract_value(loaded, 1, "match.payload"),
-        )?
-        .into_int_value();
+        let loaded = self.emit_enum_struct_value(scrutinee, &enum_key, enum_ty)?;
+        let tag =
+            build_value(self.builder.build_extract_value(loaded, 0, "match.tag"))?.into_int_value();
+        let payload_raw =
+            build_value(self.builder.build_extract_value(loaded, 1, "match.payload"))?
+                .into_int_value();
 
         let pre_match_block = current_block(self.builder)?;
         let merge_block = self.context.append_basic_block(self.function, "match.end");
@@ -1186,7 +1369,10 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
             match &arm.pattern {
                 Pattern::Wildcard { .. } => {
                     if wildcard_block.is_some() {
-                        return Err(Diagnostic::backend_at("duplicate match arm", arm.pattern.span()));
+                        return Err(Diagnostic::backend_at(
+                            "duplicate match arm",
+                            arm.pattern.span(),
+                        ));
                     }
                     wildcard_block = Some(block);
                     arm_entries.push((arm.clone(), block, None));
@@ -1207,10 +1393,7 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                 let _ = arm;
             }
         }
-        build_value(
-            self.builder
-                .build_switch(tag, default_block, &switch_cases),
-        )?;
+        build_value(self.builder.build_switch(tag, default_block, &switch_cases))?;
 
         self.builder.position_at_end(trap_block);
         let trap = self.module.get_function("llvm.trap").unwrap_or_else(|| {
@@ -1247,7 +1430,7 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                         .as_basic_value_enum(),
                         _ => return Err(unsupported_backend_type(arm.pattern.span())),
                     };
-                    let llvm_ty = llvm_basic_type(self.context, &payload_ty)?;
+                    let llvm_ty = llvm_scalar_type(self.context, &payload_ty, arm.pattern.span())?;
                     let slot = build_value(self.builder.build_alloca(llvm_ty, binding.as_str()))?;
                     build_unit(self.builder.build_store(slot, payload_value))?;
                     self.locals.insert(
@@ -1290,7 +1473,10 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
         self.builder.position_at_end(merge_block);
         self.terminated = false;
         let Some(result_llvm_ty) = result_llvm_ty else {
-            return Err(Diagnostic::backend_at("match must have at least one arm", span));
+            return Err(Diagnostic::backend_at(
+                "match must have at least one arm",
+                span,
+            ));
         };
         let result = if phi_entries.len() == 1 {
             phi_entries[0].0
@@ -1303,26 +1489,112 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
             phi.add_incoming(&incoming);
             phi.as_basic_value()
         };
-        let temp = build_value(
-            self.builder
-                .build_alloca(result_llvm_ty, "match.tmp"),
-        )?;
+        let temp = build_value(self.builder.build_alloca(result_llvm_ty, "match.tmp"))?;
         build_unit(self.builder.build_store(temp, result))?;
-        let continue_block = self
-            .context
-            .append_basic_block(self.function, "match.cont");
-        build_unit(
-            self.builder
-                .build_unconditional_branch(continue_block),
-        )?;
+        let continue_block = self.context.append_basic_block(self.function, "match.cont");
+        build_unit(self.builder.build_unconditional_branch(continue_block))?;
         self.builder.position_at_end(continue_block);
-        let loaded = build_value(self.builder.build_load(
-            result_llvm_ty,
-            temp,
-            "match.val",
-        ))?;
+        let loaded = build_value(self.builder.build_load(result_llvm_ty, temp, "match.val"))?;
         let _ = pre_match_block;
         Ok(Some(loaded))
+    }
+
+    fn type_name_for_scrutinee(&self, expr: &Expr) -> XResult<TypeName> {
+        match expr {
+            Expr::Variable { name, span } => {
+                let local = self.locals.get(name).ok_or_else(|| {
+                    Diagnostic::backend_at(format!("unknown variable `{name}`"), *span)
+                })?;
+                Ok(local.ty.clone())
+            }
+            Expr::Call { callee, .. } => self.function_return_type_name(callee),
+            Expr::QualifiedCall { module, callee, .. } => {
+                self.external_function_return_type_name(module, callee)
+            }
+            _ => Err(Diagnostic::backend_at(
+                "match scrutinee must be an enum value",
+                expr.span(),
+            )),
+        }
+    }
+
+    fn function_return_type_name(&self, callee: &str) -> XResult<TypeName> {
+        self.unit
+            .modules
+            .get(self.module_name)
+            .and_then(|module| {
+                module
+                    .program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == callee)
+            })
+            .map(|function| function.return_type.clone())
+            .ok_or_else(|| Diagnostic::backend(format!("unknown function `{callee}`"), 1, 1))
+    }
+
+    fn external_function_return_type_name(&self, module: &str, callee: &str) -> XResult<TypeName> {
+        self.unit
+            .modules
+            .get(module)
+            .and_then(|loaded| {
+                loaded
+                    .program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == callee)
+            })
+            .map(|function| {
+                if module == self.module_name {
+                    function.return_type.clone()
+                } else if let TypeName::Named(name) = &function.return_type {
+                    if enum_decl_for_key(self.unit, &enum_ir_name(module, name)).is_ok() {
+                        TypeName::Qualified {
+                            module: module.to_owned(),
+                            name: name.clone(),
+                        }
+                    } else {
+                        function.return_type.clone()
+                    }
+                } else {
+                    function.return_type.clone()
+                }
+            })
+            .ok_or_else(|| {
+                Diagnostic::backend(format!("unknown function `{module}.{callee}`"), 1, 1)
+            })
+    }
+
+    fn emit_enum_struct_value(
+        &mut self,
+        expr: &Expr,
+        enum_key: &str,
+        enum_ty: StructType<'ctx>,
+    ) -> XResult<inkwell::values::StructValue<'ctx>> {
+        if let Expr::Variable { name, span } = expr {
+            let local = self.locals.get(name).ok_or_else(|| {
+                Diagnostic::backend_at(format!("unknown variable `{name}`"), *span)
+            })?;
+            return Ok(build_value(
+                self.builder
+                    .build_load(enum_ty, local.pointer, "match.load"),
+            )?
+            .into_struct_value());
+        }
+        let value = self.emit_expr(expr)?;
+        let Some(value) = value else {
+            return Err(Diagnostic::backend_at(
+                "match scrutinee cannot be void",
+                expr.span(),
+            ));
+        };
+        if !value.is_struct_value() {
+            return Err(Diagnostic::backend_at(
+                format!("match scrutinee must be enum type `{enum_key}`"),
+                expr.span(),
+            ));
+        }
+        Ok(value.into_struct_value())
     }
 
     fn emit_match_body(&mut self, body: &MatchBody) -> XResult<Option<BasicValueEnum<'ctx>>> {
@@ -1373,8 +1645,7 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
             rendered.push(BasicMetadataValueEnum::from(value));
         }
         let call = build_value(self.builder.build_call(function, &rendered, "calltmp"))?;
-        let return_type = function_return_type(function)?;
-        if return_type == TypeName::Void {
+        if function.get_type().get_return_type().is_none() {
             Ok(None)
         } else {
             Ok(Some(call.try_as_basic_value().unwrap_basic()))
@@ -1510,11 +1781,7 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
     }
 }
 
-fn ensure_stmt_supported(
-    unit: &CompilationUnit,
-    module_name: &str,
-    stmt: &Stmt,
-) -> XResult<()> {
+fn ensure_stmt_supported(unit: &CompilationUnit, module_name: &str, stmt: &Stmt) -> XResult<()> {
     match stmt {
         Stmt::Let {
             value, annotation, ..
@@ -1592,7 +1859,9 @@ fn ensure_expr_supported(expr: &Expr) -> XResult<()> {
             ensure_expr_supported(base)?;
             ensure_expr_supported(index)
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             ensure_expr_supported(scrutinee)?;
             for arm in arms {
                 ensure_match_body_supported(arm)?;
@@ -1624,7 +1893,9 @@ fn ensure_stmt_supported_in_match(stmt: &Stmt) -> XResult<()> {
         | Stmt::Expr(value) => ensure_expr_supported(value),
         Stmt::Return { value: None, .. } => Ok(()),
         Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
-        Stmt::While { condition, body, .. } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             ensure_expr_supported(condition)?;
             for stmt in body {
                 ensure_stmt_supported_in_match(stmt)?;
@@ -1651,10 +1922,7 @@ fn ensure_stmt_supported_in_match(stmt: &Stmt) -> XResult<()> {
     }
 }
 
-fn ensure_enum_payload_backend_type(
-    ty: &TypeName,
-    span: crate::diagnostic::Span,
-) -> XResult<()> {
+fn ensure_enum_payload_backend_type(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
     match ty {
         TypeName::I32 | TypeName::Bool => Ok(()),
         _ => Err(unsupported_backend_type(span)),
@@ -1775,18 +2043,16 @@ fn struct_field_type_for_unit(
         .fields
         .get(field_index)
         .map(|field| field.ty.clone())
-        .ok_or_else(|| {
-            Diagnostic::backend(format!("invalid field index for `{struct_key}`"), 1, 1)
-        })
+        .ok_or_else(|| Diagnostic::backend(format!("invalid field index for `{struct_key}`"), 1, 1))
 }
 
 fn struct_decl_for_key<'a>(
     unit: &'a CompilationUnit,
     struct_key: &str,
 ) -> XResult<&'a crate::ast::StructDecl> {
-    let (module_name, struct_name) = struct_key.split_once('.').ok_or_else(|| {
-        Diagnostic::backend(format!("invalid struct key `{struct_key}`"), 1, 1)
-    })?;
+    let (module_name, struct_name) = struct_key
+        .split_once('.')
+        .ok_or_else(|| Diagnostic::backend(format!("invalid struct key `{struct_key}`"), 1, 1))?;
     let module = unit
         .modules
         .get(module_name)
@@ -1836,7 +2102,10 @@ fn variant_payload_type(
         .iter()
         .find(|v| v.name == variant)
         .ok_or_else(|| Diagnostic::backend(format!("unknown variant `{variant}`"), 1, 1))?;
-    Ok(variant_decl.payload.as_ref().map(|payload| payload.ty.clone()))
+    Ok(variant_decl
+        .payload
+        .as_ref()
+        .map(|payload| payload.ty.clone()))
 }
 
 fn insert_enum_key_if_exists(
@@ -1872,14 +2141,18 @@ fn collect_enum_types_in_stmts(
 ) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { annotation, value, .. } => {
+            Stmt::Let {
+                annotation, value, ..
+            } => {
                 if let Some(ty) = annotation {
                     insert_enum_key_if_exists(unit, module_name, ty, keys);
                 }
                 collect_enum_types_in_expr(unit, value, module_name, keys);
             }
             Stmt::Assign { value, .. }
-            | Stmt::Return { value: Some(value), .. }
+            | Stmt::Return {
+                value: Some(value), ..
+            }
             | Stmt::Expr(value) => collect_enum_types_in_expr(unit, value, module_name, keys),
             Stmt::If {
                 condition,
@@ -1891,7 +2164,9 @@ fn collect_enum_types_in_stmts(
                 collect_enum_types_in_stmts(unit, then_body, module_name, keys);
                 collect_enum_types_in_stmts(unit, else_body, module_name, keys);
             }
-            Stmt::While { condition, body, .. } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 collect_enum_types_in_expr(unit, condition, module_name, keys);
                 collect_enum_types_in_stmts(unit, body, module_name, keys);
             }
@@ -1914,7 +2189,9 @@ fn collect_enum_types_in_expr(
     keys: &mut std::collections::HashSet<String>,
 ) {
     match expr {
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_enum_types_in_expr(unit, scrutinee, module_name, keys);
             for arm in arms {
                 match &arm.body {
@@ -1984,14 +2261,18 @@ fn collect_struct_types_in_stmts(
 ) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { annotation, value, .. } => {
+            Stmt::Let {
+                annotation, value, ..
+            } => {
                 if let Some(ty) = annotation {
                     insert_struct_key_if_exists(unit, module_name, ty, keys);
                 }
                 collect_struct_types_in_expr(unit, value, module_name, keys);
             }
             Stmt::Assign { value, .. }
-            | Stmt::Return { value: Some(value), .. }
+            | Stmt::Return {
+                value: Some(value), ..
+            }
             | Stmt::Expr(value) => collect_struct_types_in_expr(unit, value, module_name, keys),
             Stmt::If {
                 condition,
@@ -2003,7 +2284,9 @@ fn collect_struct_types_in_stmts(
                 collect_struct_types_in_stmts(unit, then_body, module_name, keys);
                 collect_struct_types_in_stmts(unit, else_body, module_name, keys);
             }
-            Stmt::While { condition, body, .. } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 collect_struct_types_in_expr(unit, condition, module_name, keys);
                 collect_struct_types_in_stmts(unit, body, module_name, keys);
             }
@@ -2045,8 +2328,12 @@ fn collect_struct_types_in_expr(
             collect_struct_types_in_expr(unit, base, module_name, keys);
             collect_struct_types_in_expr(unit, index, module_name, keys);
         }
-        Expr::FieldAccess { base, .. } => collect_struct_types_in_expr(unit, base, module_name, keys),
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::FieldAccess { base, .. } => {
+            collect_struct_types_in_expr(unit, base, module_name, keys)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_struct_types_in_expr(unit, scrutinee, module_name, keys);
             for arm in arms {
                 match &arm.body {
@@ -2063,12 +2350,17 @@ fn collect_struct_types_in_expr(
     }
 }
 
-fn collect_qualified_calls(stmts: &[Stmt], needed: &mut std::collections::HashSet<(String, String)>) {
+fn collect_qualified_calls(
+    stmts: &[Stmt],
+    needed: &mut std::collections::HashSet<(String, String)>,
+) {
     for stmt in stmts {
         match stmt {
             Stmt::Let { value, .. }
             | Stmt::Assign { value, .. }
-            | Stmt::Return { value: Some(value), .. }
+            | Stmt::Return {
+                value: Some(value), ..
+            }
             | Stmt::Expr(value) => collect_qualified_calls_in_expr(value, needed),
             Stmt::If {
                 condition,
@@ -2080,7 +2372,9 @@ fn collect_qualified_calls(stmts: &[Stmt], needed: &mut std::collections::HashSe
                 collect_qualified_calls(then_body, needed);
                 collect_qualified_calls(else_body, needed);
             }
-            Stmt::While { condition, body, .. } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 collect_qualified_calls_in_expr(condition, needed);
                 collect_qualified_calls(body, needed);
             }
@@ -2099,7 +2393,12 @@ fn collect_qualified_calls_in_expr(
     needed: &mut std::collections::HashSet<(String, String)>,
 ) {
     match expr {
-        Expr::QualifiedCall { module, callee, args, .. } => {
+        Expr::QualifiedCall {
+            module,
+            callee,
+            args,
+            ..
+        } => {
             needed.insert((module.clone(), callee.clone()));
             for arg in args {
                 collect_qualified_calls_in_expr(arg, needed);
@@ -2125,6 +2424,17 @@ fn collect_qualified_calls_in_expr(
             collect_qualified_calls_in_expr(index, needed);
         }
         Expr::FieldAccess { base, .. } => collect_qualified_calls_in_expr(base, needed),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_qualified_calls_in_expr(scrutinee, needed);
+            for arm in arms {
+                match &arm.body {
+                    MatchBody::Expr(expr) => collect_qualified_calls_in_expr(expr, needed),
+                    MatchBody::Block(stmts) => collect_qualified_calls(stmts, needed),
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -2141,11 +2451,102 @@ fn llvm_scalar_type<'ctx>(
     }
 }
 
-fn ensure_backend_type(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
+fn ensure_backend_signature_type(
+    unit: &CompilationUnit,
+    module_name: &str,
+    ty: &TypeName,
+    span: crate::diagnostic::Span,
+) -> XResult<()> {
     match ty {
         TypeName::I32 | TypeName::Bool | TypeName::Void => Ok(()),
-        TypeName::Array { .. } | TypeName::Str | TypeName::Named(_) | TypeName::Qualified { .. } => {
-            Err(unsupported_backend_type(span))
+        TypeName::Str | TypeName::Array { .. } => Err(unsupported_backend_type(span)),
+        TypeName::Named(name) => {
+            let enum_key = enum_ir_name(module_name, name);
+            if enum_decl_for_key(unit, &enum_key).is_ok() {
+                Ok(())
+            } else if struct_decl_for_key(unit, &struct_ir_name(module_name, name)).is_ok() {
+                Err(Diagnostic::backend_at(
+                    format!("struct type `{name}` is not supported in function signatures yet"),
+                    span,
+                ))
+            } else {
+                Err(Diagnostic::backend_at(
+                    format!("unknown enum type `{name}`"),
+                    span,
+                ))
+            }
+        }
+        TypeName::Qualified { module, name } => {
+            let enum_key = enum_ir_name(module, name);
+            if enum_decl_for_key(unit, &enum_key).is_ok() {
+                Ok(())
+            } else if struct_decl_for_key(unit, &struct_ir_name(module, name)).is_ok() {
+                Err(Diagnostic::backend_at(
+                    format!(
+                        "struct type `{module}.{name}` is not supported in function signatures yet"
+                    ),
+                    span,
+                ))
+            } else {
+                Err(Diagnostic::backend_at(
+                    format!("unknown enum type `{module}.{name}`"),
+                    span,
+                ))
+            }
+        }
+    }
+}
+
+fn ensure_declared_enum_types_for_signature<'ctx>(
+    context: &'ctx Context,
+    unit: &CompilationUnit,
+    module_name: &str,
+    enum_types: &mut HashMap<String, StructType<'ctx>>,
+    return_type: &TypeName,
+    params: &[TypeName],
+) -> XResult<()> {
+    insert_declared_enum_type(context, unit, module_name, enum_types, return_type)?;
+    for param in params {
+        insert_declared_enum_type(context, unit, module_name, enum_types, param)?;
+    }
+    Ok(())
+}
+
+fn insert_declared_enum_type<'ctx>(
+    context: &'ctx Context,
+    unit: &CompilationUnit,
+    module_name: &str,
+    enum_types: &mut HashMap<String, StructType<'ctx>>,
+    ty: &TypeName,
+) -> XResult<()> {
+    let Some(key) = enum_key_from_type(module_name, ty) else {
+        return Ok(());
+    };
+    if enum_types.contains_key(&key) {
+        return Ok(());
+    }
+    if enum_decl_for_key(unit, &key).is_err() {
+        return Ok(());
+    }
+    let i32 = context.i32_type();
+    let enum_type = context
+        .get_struct_type(&key)
+        .unwrap_or_else(|| context.opaque_struct_type(&key));
+    enum_type.set_body(&[i32.into(), i32.into()], false);
+    enum_types.insert(key, enum_type);
+    Ok(())
+}
+
+fn collect_enum_types_in_signatures(
+    unit: &CompilationUnit,
+    program: &Program,
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    for function in &program.functions {
+        insert_enum_key_if_exists(unit, module_name, &function.return_type, keys);
+        for param in &function.params {
+            insert_enum_key_if_exists(unit, module_name, &param.ty, keys);
         }
     }
 }
@@ -2164,35 +2565,34 @@ fn llvm_array_type<'ctx>(
     }
 }
 
-fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: &TypeName) -> XResult<BasicTypeEnum<'ctx>> {
+fn llvm_basic_type<'ctx>(
+    context: &'ctx Context,
+    enum_types: &HashMap<String, StructType<'ctx>>,
+    unit: &CompilationUnit,
+    module_name: &str,
+    ty: &TypeName,
+) -> XResult<BasicTypeEnum<'ctx>> {
     match ty {
         TypeName::I32 => Ok(context.i32_type().as_basic_type_enum()),
         TypeName::Bool => Ok(context.bool_type().as_basic_type_enum()),
-        TypeName::Void | TypeName::Str | TypeName::Named(_) | TypeName::Qualified { .. } | TypeName::Array { .. } => Err(
-            unsupported_backend_type(crate::diagnostic::Span::point(1, 1)),
-        ),
+        TypeName::Named(_) | TypeName::Qualified { .. } => {
+            let key = enum_key_from_type(module_name, ty)
+                .ok_or_else(|| unsupported_backend_type(crate::diagnostic::Span::point(1, 1)))?;
+            enum_types
+                .get(&key)
+                .map(|enum_ty| (*enum_ty).as_basic_type_enum())
+                .ok_or_else(|| {
+                    if enum_decl_for_key(unit, &key).is_ok() {
+                        Diagnostic::backend(format!("missing enum type `{key}`"), 1, 1)
+                    } else {
+                        unsupported_backend_type(crate::diagnostic::Span::point(1, 1))
+                    }
+                })
+        }
+        TypeName::Void | TypeName::Str | TypeName::Array { .. } => Err(unsupported_backend_type(
+            crate::diagnostic::Span::point(1, 1),
+        )),
     }
-}
-
-fn function_return_type(function: FunctionValue<'_>) -> XResult<TypeName> {
-    let Some(return_type) = function.get_type().get_return_type() else {
-        return Ok(TypeName::Void);
-    };
-    if return_type.is_int_type() {
-        let width = return_type.into_int_type().get_bit_width();
-        return match width {
-            1 => Ok(TypeName::Bool),
-            32 => Ok(TypeName::I32),
-            _ => Err(Diagnostic::backend(
-                format!("unsupported LLVM integer return width `{width}`"),
-                1,
-                1,
-            )),
-        };
-    }
-    Err(unsupported_backend_type(crate::diagnostic::Span::point(
-        1, 1,
-    )))
 }
 
 fn expect_int_value(value: Option<BasicValueEnum<'_>>) -> XResult<inkwell::values::IntValue<'_>> {
@@ -2218,10 +2618,12 @@ fn build_enum_value<'ctx>(
     payload: inkwell::values::IntValue<'ctx>,
 ) -> XResult<inkwell::values::StructValue<'ctx>> {
     let undef = enum_ty.get_undef();
-    let with_tag = build_value(builder.build_insert_value(undef, tag, 0, "enum.tag"))?
-        .into_struct_value();
-    Ok(build_value(builder.build_insert_value(with_tag, payload, 1, "enum.val"))?
-        .into_struct_value())
+    let with_tag =
+        build_value(builder.build_insert_value(undef, tag, 0, "enum.tag"))?.into_struct_value();
+    Ok(
+        build_value(builder.build_insert_value(with_tag, payload, 1, "enum.val"))?
+            .into_struct_value(),
+    )
 }
 
 fn build_value<T>(result: Result<T, inkwell::builder::BuilderError>) -> XResult<T> {

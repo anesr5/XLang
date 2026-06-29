@@ -34,11 +34,26 @@ i32 add(i32 a, i32 b) {
     return a + b;
 }
 
-i32 main() {
-    i32 x = add(40, 2);
-    return x;
-}
+    i32 main() {
+        i32 x = add(40, 2);
+        return x;
+    }
 "#;
+
+    fn write_module_fixture(case: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("xlang_{case}_{}_{}", std::process::id(), unique));
+        std::fs::create_dir_all(&dir).expect("failed to create temporary XLang fixture");
+        for (file_name, source) in files {
+            std::fs::write(dir.join(file_name), source)
+                .expect("failed to write temporary XLang fixture source");
+        }
+        dir.join("main.x")
+    }
 
     #[test]
     fn lexes_semicolon_token() {
@@ -249,6 +264,109 @@ entry:
   %x.load = load i32, ptr %x, align 4
   ret i32 %x.load
 }
+"#
+        );
+    }
+
+    #[test]
+    fn emits_stable_v0_6_enum_abi_snapshot() {
+        let options = CompileOptions {
+            target_triple: Some("x86_64-unknown-linux-gnu".to_owned()),
+        };
+        let llvm_ir = compile::emit_llvm_source_with_options(
+            r#"
+module main
+
+enum ResultI32 {
+    Ok(i32 value);
+    Err(i32 code);
+}
+
+ResultI32 identity(ResultI32 input) {
+    return input;
+}
+
+ResultI32 make_ok(i32 value) {
+    return Ok(value);
+}
+
+i32 main() {
+    return match identity(make_ok(7)) {
+        Ok(v) => v,
+        Err(code) => code,
+    };
+}
+"#,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(
+            llvm_ir,
+            r#"; ModuleID = 'xlang.main'
+source_filename = "xlang.main"
+target triple = "x86_64-unknown-linux-gnu"
+
+%main.ResultI32.tagged = type { i32, i32 }
+
+define %main.ResultI32.tagged @xlang.main.identity(%main.ResultI32.tagged %input) {
+entry:
+  %input.addr = alloca %main.ResultI32.tagged, align 8
+  store %main.ResultI32.tagged %input, ptr %input.addr, align 4
+  %input.load = load %main.ResultI32.tagged, ptr %input.addr, align 4
+  ret %main.ResultI32.tagged %input.load
+}
+
+define %main.ResultI32.tagged @xlang.main.make_ok(i32 %value) {
+entry:
+  %value.addr = alloca i32, align 4
+  store i32 %value, ptr %value.addr, align 4
+  %value.load = load i32, ptr %value.addr, align 4
+  %enum.val = insertvalue %main.ResultI32.tagged { i32 0, i32 undef }, i32 %value.load, 1
+  ret %main.ResultI32.tagged %enum.val
+}
+
+define i32 @main() {
+entry:
+  %calltmp = call %main.ResultI32.tagged @xlang.main.make_ok(i32 7)
+  %calltmp1 = call %main.ResultI32.tagged @xlang.main.identity(%main.ResultI32.tagged %calltmp)
+  %match.tag = extractvalue %main.ResultI32.tagged %calltmp1, 0
+  %match.payload = extractvalue %main.ResultI32.tagged %calltmp1, 1
+  switch i32 %match.tag, label %match.trap [
+    i32 0, label %match.arm.0
+    i32 1, label %match.arm.1
+  ]
+
+match.end:                                        ; preds = %match.arm.1, %match.arm.0
+  %match.result = phi i32 [ %v.load, %match.arm.0 ], [ %code.load, %match.arm.1 ]
+  %match.tmp = alloca i32, align 4
+  store i32 %match.result, ptr %match.tmp, align 4
+  br label %match.cont
+
+match.trap:                                       ; preds = %entry
+  call void @llvm.trap()
+  unreachable
+
+match.arm.0:                                      ; preds = %entry
+  %v = alloca i32, align 4
+  store i32 %match.payload, ptr %v, align 4
+  %v.load = load i32, ptr %v, align 4
+  br label %match.end
+
+match.arm.1:                                      ; preds = %entry
+  %code = alloca i32, align 4
+  store i32 %match.payload, ptr %code, align 4
+  %code.load = load i32, ptr %code, align 4
+  br label %match.end
+
+match.cont:                                       ; preds = %match.end
+  %match.val = load i32, ptr %match.tmp, align 4
+  ret i32 %match.val
+}
+
+; Function Attrs: cold noreturn nounwind memory(inaccessiblemem: write)
+declare void @llvm.trap() #0
+
+attributes #0 = { cold noreturn nounwind memory(inaccessiblemem: write) }
 "#
         );
     }
@@ -1515,8 +1633,8 @@ i32 main() {
 
     #[test]
     fn v0_4_multi_module_example_typechecks() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/v0.4/main.x");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/v0.4/main.x");
         compile::check(&path).unwrap();
     }
 
@@ -1529,8 +1647,8 @@ i32 main() {
 
     #[test]
     fn v0_5_enum_example_runs() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/v0.5/main.x");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/v0.5/main.x");
         compile::check(&path).unwrap();
         compile::emit_llvm(&path).unwrap();
     }
@@ -1658,5 +1776,415 @@ i32 main() { return 0; }
 "#;
         let err = compile::check_source(source).unwrap_err();
         assert!(err.message.contains("payload type `str` is not supported"));
+    }
+
+    #[test]
+    fn v0_6_multi_module_enum_return_example_runs() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/v0.6/main.x");
+        compile::check(&path).unwrap();
+        compile::emit_llvm(&path).unwrap();
+    }
+
+    #[test]
+    fn emits_v0_6_cross_module_enum_abi_snapshot() {
+        let path = write_module_fixture(
+            "cross_module_enum_abi",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import math
+
+i32 main() {
+    return match math.divide(10, 2) {
+        Ok(v) => v,
+        Err(code) => code,
+    };
+}
+"#,
+                ),
+                (
+                    "math.x",
+                    r#"
+module math
+
+pub enum ResultI32 {
+    Ok(i32 value);
+    Err(i32 code);
+}
+
+pub ResultI32 divide(i32 a, i32 b) {
+    if b == 0 {
+        return Err(1);
+    }
+    return Ok(a / b);
+}
+"#,
+                ),
+            ],
+        );
+        let checked = compile::check(&path).unwrap();
+        let modules = backend::llvm::emit_compilation_unit(
+            &checked.unit,
+            &backend::llvm::LlvmOptions {
+                target_triple: Some("x86_64-unknown-linux-gnu".to_owned()),
+            },
+        )
+        .unwrap();
+        let main_ir = modules.get("main").expect("main module IR");
+        let math_ir = modules.get("math").expect("math module IR");
+
+        assert!(math_ir.contains("%math.ResultI32.tagged = type { i32, i32 }"));
+        assert!(
+            math_ir.contains("define %math.ResultI32.tagged @xlang.math.divide(i32 %a, i32 %b)")
+        );
+        assert!(math_ir.contains("ret %math.ResultI32.tagged"));
+        assert!(main_ir.contains("%math.ResultI32.tagged = type { i32, i32 }"));
+        assert!(main_ir.contains("declare %math.ResultI32.tagged @xlang.math.divide(i32, i32)"));
+        assert!(
+            main_ir.contains(
+                "%calltmp = call %math.ResultI32.tagged @xlang.math.divide(i32 10, i32 2)"
+            )
+        );
+        assert!(main_ir.contains("extractvalue %math.ResultI32.tagged %calltmp, 0"));
+        assert!(main_ir.contains("extractvalue %math.ResultI32.tagged %calltmp, 1"));
+    }
+
+    #[test]
+    fn emits_v0_6_cross_module_enum_parameter_abi_snapshot() {
+        let path = write_module_fixture(
+            "cross_module_enum_param_abi",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import math
+
+i32 main() {
+    return math.unwrap(math.ok(9));
+}
+"#,
+                ),
+                (
+                    "math.x",
+                    r#"
+module math
+
+pub enum ResultI32 {
+    Ok(i32 value);
+    Err(i32 code);
+}
+
+pub ResultI32 ok(i32 value) {
+    return Ok(value);
+}
+
+pub i32 unwrap(ResultI32 r) {
+    return match r {
+        Ok(v) => v,
+        Err(code) => code,
+    };
+}
+"#,
+                ),
+            ],
+        );
+        let checked = compile::check(&path).unwrap();
+        let modules = backend::llvm::emit_compilation_unit(
+            &checked.unit,
+            &backend::llvm::LlvmOptions {
+                target_triple: Some("x86_64-unknown-linux-gnu".to_owned()),
+            },
+        )
+        .unwrap();
+        let main_ir = modules.get("main").expect("main module IR");
+        let math_ir = modules.get("math").expect("math module IR");
+
+        assert!(math_ir.contains("define i32 @xlang.math.unwrap(%math.ResultI32.tagged %r)"));
+        assert!(math_ir.contains("%r.addr = alloca %math.ResultI32.tagged"));
+        assert!(math_ir.contains("store %math.ResultI32.tagged %r, ptr %r.addr"));
+        assert!(main_ir.contains("declare i32 @xlang.math.unwrap(%math.ResultI32.tagged)"));
+        assert!(main_ir.contains("%calltmp = call %math.ResultI32.tagged @xlang.math.ok(i32 9)"));
+        assert!(
+            main_ir.contains(
+                "%calltmp1 = call i32 @xlang.math.unwrap(%math.ResultI32.tagged %calltmp)"
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_private_cross_module_enum_type_name() {
+        let path = write_module_fixture(
+            "private_enum_type",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import math
+
+math.Hidden expose() {
+    return math.make();
+}
+
+i32 main() { return 0; }
+"#,
+                ),
+                (
+                    "math.x",
+                    r#"
+module math
+
+enum Hidden {
+    Value(i32 value);
+    Empty;
+}
+
+pub Hidden make() {
+    return Value(1);
+}
+"#,
+                ),
+            ],
+        );
+        let err = compile::check(&path).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("cannot use private enum"));
+    }
+
+    #[test]
+    fn rejects_public_function_leaking_private_enum() {
+        let path = write_module_fixture(
+            "private_enum_leak",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import math
+
+i32 main() {
+    return match math.make() {
+        Value(v) => v,
+        Empty => 0,
+    };
+}
+"#,
+                ),
+                (
+                    "math.x",
+                    r#"
+module math
+
+enum Hidden {
+    Value(i32 value);
+    Empty;
+}
+
+pub Hidden make() {
+    return Value(1);
+}
+"#,
+                ),
+            ],
+        );
+        let err = compile::check(&path).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("cannot use private enum"));
+    }
+
+    #[test]
+    fn rejects_private_cross_module_enum_local_annotation() {
+        let path = write_module_fixture(
+            "private_enum_local",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import math
+
+i32 main() {
+    math.Hidden value = Hidden(1);
+    return 0;
+}
+"#,
+                ),
+                (
+                    "math.x",
+                    r#"
+module math
+
+enum Hidden {
+    Value(i32 value);
+    Empty;
+}
+"#,
+                ),
+            ],
+        );
+        let err = compile::check(&path).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("cannot use private enum"));
+    }
+
+    #[test]
+    fn accepts_enum_returning_function() {
+        let source = r#"
+module main
+
+enum ResultI32 {
+    Ok(i32 value);
+    Err(i32 code);
+}
+
+ResultI32 f() {
+    return Ok(1);
+}
+
+i32 main() {
+    return match f() {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+}
+"#;
+        compile::check_source(source).unwrap();
+        compile::emit_llvm_source(source).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_variant_constructor_in_enum_return() {
+        let source = r#"
+module main
+
+enum ResultI32 {
+    Ok(i32 value);
+    Err(i32 code);
+}
+
+ResultI32 f() {
+    return Nope(1);
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("unknown variant"));
+    }
+
+    #[test]
+    fn rejects_unknown_enum_in_function_signature() {
+        let source = r#"
+module main
+
+Missing f() {
+    return 0;
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("unknown enum type"));
+    }
+
+    #[test]
+    fn rejects_unknown_module_in_qualified_enum_signature() {
+        let source = r#"
+module main
+
+other.Result f() {
+    return 0;
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("unknown module"));
+    }
+
+    #[test]
+    fn rejects_array_in_function_signature() {
+        let source = r#"
+module main
+
+i32[2] f() {
+    return 0;
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(
+            err.message
+                .contains("array type not supported in function signatures yet")
+        );
+    }
+
+    #[test]
+    fn rejects_enum_return_type_mismatch() {
+        let source = r#"
+module main
+
+enum ResultI32 {
+    Ok(i32 value);
+    Err(i32 code);
+}
+
+ResultI32 f() {
+    return 1;
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("return type mismatch") || err.message.contains("expected"));
+    }
+
+    #[test]
+    fn rejects_struct_in_function_signature() {
+        let source = r#"
+module main
+
+struct Point {
+    i32 x;
+}
+
+Point f() {
+    return { 0 };
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(
+            err.message
+                .contains("not supported in function signatures yet")
+        );
+    }
+
+    #[test]
+    fn rejects_main_returning_enum() {
+        let source = r#"
+module main
+
+enum E {
+    A;
+}
+
+E main() {
+    return A();
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("`main` must return i32"));
     }
 }

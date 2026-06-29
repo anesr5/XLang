@@ -25,10 +25,7 @@ pub struct CompilationUnit {
 impl CompilationUnit {
     pub fn from_program(program: Program) -> XResult<Self> {
         validate_imports(&program)?;
-        let name = program
-            .module
-            .clone()
-            .unwrap_or_else(|| "main".to_owned());
+        let name = program.module.clone().unwrap_or_else(|| "main".to_owned());
         let implicit_pub = program.imports.is_empty();
         let module = LoadedModule {
             name: name.clone(),
@@ -52,9 +49,9 @@ impl CompilationUnit {
     }
 
     pub fn load(entry: &Path) -> XResult<Self> {
-        let entry = entry.canonicalize().map_err(|err| {
-            Diagnostic::io(format!("failed to resolve entry path: {err}"), 1, 1)
-        })?;
+        let entry = entry
+            .canonicalize()
+            .map_err(|err| Diagnostic::io(format!("failed to resolve entry path: {err}"), 1, 1))?;
         let project_root = entry
             .parent()
             .map(Path::to_path_buf)
@@ -66,13 +63,7 @@ impl CompilationUnit {
             modules: HashMap::new(),
         };
 
-        let entry_name = load_module_file(
-            &mut unit,
-            &entry,
-            &project_root,
-            &mut Vec::new(),
-            true,
-        )?;
+        let entry_name = load_module_file(&mut unit, &entry, &project_root, &mut Vec::new(), true)?;
         unit.entry = entry_name;
         Ok(unit)
     }
@@ -95,19 +86,16 @@ fn load_module_file(
     stack: &mut Vec<String>,
     is_entry: bool,
 ) -> XResult<String> {
-    let source = fs::read_to_string(path)
-        .map_err(|err| Diagnostic::io(format!("failed to read `{}`: {err}", path.display()), 1, 1))?;
+    let source = fs::read_to_string(path).map_err(|err| {
+        Diagnostic::io(format!("failed to read `{}`: {err}", path.display()), 1, 1)
+    })?;
     let tokens = lexer::lex(&source)?;
     let program = parser::parse(tokens)?;
     validate_imports(&program)?;
 
     let expected = expected_module_name_from_path(path, project_root)?;
     let declared = program.module.as_deref().ok_or_else(|| {
-        Diagnostic::type_error(
-            "expected `module` declaration at top of file",
-            1,
-            1,
-        )
+        Diagnostic::type_error("expected `module` declaration at top of file", 1, 1)
     })?;
     if declared != expected {
         return Err(Diagnostic::type_error(
@@ -216,7 +204,11 @@ fn resolve_module_path(root: &Path, name: &str) -> XResult<Option<PathBuf>> {
     let nested_exists = nested.is_file();
     if flat_exists && nested_exists {
         return Err(Diagnostic::type_error(
-            format!("ambiguous module layout for `{name}`: both `{}` and `{}` exist", flat.display(), nested.display()),
+            format!(
+                "ambiguous module layout for `{name}`: both `{}` and `{}` exist",
+                flat.display(),
+                nested.display()
+            ),
             1,
             1,
         ));

@@ -430,7 +430,9 @@ fn index_expr(
             field_span,
             ..
         } => index_field_reference(index, scope, base, field, *field_span, alloc_id),
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             index_expr(index, scrutinee, scope, alloc_id);
             for arm in arms {
                 index_match_pattern(index, scope, &arm.pattern, alloc_id);
@@ -1000,7 +1002,9 @@ fn type_summary(ty: &TypeName) -> Option<&'static str> {
         TypeName::Bool => Some("Boolean value (`true` or `false`), lowered as LLVM `i1`."),
         TypeName::Str => Some("String type accepted by the frontend; not lowered to LLVM in v0.1."),
         TypeName::Void => Some("Absence of value. Valid only as a function return type."),
-        TypeName::Named(_) | TypeName::Qualified { .. } => Some("User-defined struct type with stack-allocated locals (v0.3)."),
+        TypeName::Named(_) | TypeName::Qualified { .. } => {
+            Some("User-defined struct type with stack-allocated locals (v0.3).")
+        }
         TypeName::Array { elem, .. } => match elem.as_ref() {
             TypeName::I32 => Some("Fixed-size stack array of `i32` elements (v0.2)."),
             TypeName::Bool => Some("Fixed-size stack array of `bool` elements (v0.2)."),
@@ -1018,7 +1022,9 @@ fn type_usage(ty: &TypeName) -> Option<&'static str> {
             Some("**Usage** — expressions, locals, parameters, return types (frontend only)")
         }
         TypeName::Void => Some("**Usage** — function return type only"),
-        TypeName::Named(_) | TypeName::Qualified { .. } => Some("**Usage** — local bindings with struct literals"),
+        TypeName::Named(_) | TypeName::Qualified { .. } => {
+            Some("**Usage** — local bindings with struct literals")
+        }
         TypeName::Array { .. } => Some("**Usage** — local bindings with array literals"),
     }
 }
@@ -1029,7 +1035,9 @@ fn type_codegen_note(ty: &TypeName) -> Option<&'static str> {
         TypeName::Str => {
             Some("**Codegen** — not supported (`x check` may pass, `x emit-llvm` fails)")
         }
-        TypeName::Named(_) | TypeName::Qualified { .. } => Some("**Codegen** — supported (scalar fields only)"),
+        TypeName::Named(_) | TypeName::Qualified { .. } => {
+            Some("**Codegen** — supported (scalar fields only)")
+        }
         TypeName::Array { elem, .. } => match elem.as_ref() {
             TypeName::I32 | TypeName::Bool => Some("**Codegen** — supported (with bounds checks)"),
             _ => Some("**Codegen** — not supported"),

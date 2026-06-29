@@ -95,9 +95,7 @@ impl TypeName {
     pub fn struct_ref(&self) -> Option<StructRef<'_>> {
         match self {
             TypeName::Named(name) => Some(StructRef::Local(name)),
-            TypeName::Qualified { module, name } => {
-                Some(StructRef::Qualified { module, name })
-            }
+            TypeName::Qualified { module, name } => Some(StructRef::Qualified { module, name }),
             _ => None,
         }
     }
@@ -105,9 +103,7 @@ impl TypeName {
     pub fn enum_ref(&self) -> Option<EnumRef<'_>> {
         match self {
             TypeName::Named(name) => Some(EnumRef::Local(name)),
-            TypeName::Qualified { module, name } => {
-                Some(EnumRef::Qualified { module, name })
-            }
+            TypeName::Qualified { module, name } => Some(EnumRef::Qualified { module, name }),
             _ => None,
         }
     }

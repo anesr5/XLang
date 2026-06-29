@@ -118,7 +118,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_function(&self, function: &Function) -> XResult<()> {
-        ensure_supported_signature_type(
+        self.validate_signature_type(
             &function.return_type,
             function.return_type_span.unwrap_or(function.name_span),
         )?;
@@ -131,7 +131,7 @@ impl<'a> TypeChecker<'a> {
                     param.name_span,
                 ));
             }
-            ensure_supported_signature_type(&param.ty, param.ty_span)?;
+            self.validate_signature_type(&param.ty, param.ty_span)?;
             if param.ty == TypeName::Void {
                 return Err(Diagnostic::type_error_at(
                     format!("parameter `{}` cannot have type void", param.name),
@@ -184,17 +184,60 @@ impl<'a> TypeChecker<'a> {
                 }
                 let binding_ty = if let Some(enum_ref) =
                     annotation.as_ref().and_then(TypeName::enum_ref)
-                    && self.is_known_enum(enum_ref, annotation_span.unwrap_or(*name_span))
+                    && self.is_declared_enum(enum_ref)
                 {
-                    self.check_enum_constructor(
-                        enum_ref,
-                        value,
-                        annotation_span.unwrap_or(*name_span),
-                        locals,
-                    )?;
+                    let span = annotation_span.unwrap_or(*name_span);
+                    self.resolve_enum_layout(enum_ref, span)?;
+                    if let Expr::Call { callee, .. } = value {
+                        if self.is_enum_variant_constructor(enum_ref, value, span)
+                            || !self.functions.contains_key(callee)
+                        {
+                            self.check_enum_constructor(enum_ref, value, span, locals)?;
+                        } else {
+                            let value_ty = self.check_expr(value, locals)?;
+                            if value_ty == TypeName::Void {
+                                return Err(Diagnostic::type_error_at(
+                                    format!("cannot bind void value to `{name}`"),
+                                    value.span(),
+                                ));
+                            }
+                            if annotation.as_ref() != Some(&value_ty) {
+                                return Err(Diagnostic::type_error_at(
+                                    format!(
+                                        "cannot assign {} to {}",
+                                        type_name_display(&value_ty),
+                                        type_name_display(annotation.as_ref().unwrap())
+                                    ),
+                                    value.span(),
+                                ));
+                            }
+                        }
+                    } else {
+                        let value_ty = self.check_expr(value, locals)?;
+                        if value_ty == TypeName::Void {
+                            return Err(Diagnostic::type_error_at(
+                                format!("cannot bind void value to `{name}`"),
+                                value.span(),
+                            ));
+                        }
+                        if annotation.as_ref() != Some(&value_ty) {
+                            return Err(Diagnostic::type_error_at(
+                                format!(
+                                    "cannot assign {} to {}",
+                                    type_name_display(&value_ty),
+                                    type_name_display(annotation.as_ref().unwrap())
+                                ),
+                                value.span(),
+                            ));
+                        }
+                    }
                     annotation.clone().unwrap()
-                } else if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
-                    self.validate_struct_local_type(struct_ref, annotation_span.unwrap_or(*name_span))?;
+                } else if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref)
+                {
+                    self.validate_struct_local_type(
+                        struct_ref,
+                        annotation_span.unwrap_or(*name_span),
+                    )?;
                     if !matches!(value, Expr::StructLiteral { .. }) {
                         return Err(Diagnostic::type_error_at(
                             format!("struct local `{name}` requires a struct literal initializer"),
@@ -784,10 +827,7 @@ impl<'a> TypeChecker<'a> {
         span: Span,
         locals: &HashMap<String, (TypeName, bool)>,
     ) -> XResult<()> {
-        let Expr::Call {
-            callee, args, ..
-        } = value
-        else {
+        let Expr::Call { callee, args, .. } = value else {
             return Err(Diagnostic::type_error_at(
                 "enum local requires variant constructor initializer",
                 value.span(),
@@ -840,7 +880,9 @@ impl<'a> TypeChecker<'a> {
     ) -> XResult<TypeName> {
         if let Some(enum_ref) = expected.enum_ref()
             && self.is_known_enum(enum_ref, expr.span())
-            && matches!(expr, Expr::Call { .. })
+            && let Expr::Call { callee, .. } = expr
+            && (self.is_enum_variant_constructor(enum_ref, expr, expr.span())
+                || !self.functions.contains_key(callee))
         {
             self.check_enum_constructor(enum_ref, expr, expr.span(), locals)?;
             return Ok(expected.clone());
@@ -861,6 +903,16 @@ impl<'a> TypeChecker<'a> {
 
     fn is_known_enum(&self, enum_ref: EnumRef<'_>, span: Span) -> bool {
         self.resolve_enum_layout(enum_ref, span).is_ok()
+    }
+
+    fn is_declared_enum(&self, enum_ref: EnumRef<'_>) -> bool {
+        match enum_ref {
+            EnumRef::Local(name) => self.enums.contains_key(name),
+            EnumRef::Qualified { module, name } => self
+                .exports
+                .get(module)
+                .is_some_and(|module_exports| module_exports.enums.contains_key(name)),
+        }
     }
 
     fn is_enum_local_type(&self, ty: &TypeName) -> bool {
@@ -884,9 +936,16 @@ impl<'a> TypeChecker<'a> {
                 let module_exports = self.exports.get(module).ok_or_else(|| {
                     Diagnostic::type_error_at(format!("unknown module `{module}`"), span)
                 })?;
-                module_exports.enums.get(name).ok_or_else(|| {
+                let layout = module_exports.enums.get(name).ok_or_else(|| {
                     Diagnostic::type_error_at(format!("unknown enum type `{module}.{name}`"), span)
-                })
+                })?;
+                if module != self.module_name && !layout.pub_export {
+                    return Err(Diagnostic::type_error_at(
+                        format!("cannot use private enum `{name}` from module `{module}`"),
+                        span,
+                    ));
+                }
+                Ok(layout)
             }
         }
     }
@@ -1036,7 +1095,7 @@ impl<'a> TypeChecker<'a> {
                 ));
             }
         }
-        Ok(sig.return_type.clone())
+        Ok(self.qualify_cross_module_type(self.module_name, &sig.return_type))
     }
 
     fn check_qualified_call(
@@ -1071,6 +1130,9 @@ impl<'a> TypeChecker<'a> {
                 span,
             ));
         }
+        for expected in sig.params.iter().chain(std::iter::once(&sig.return_type)) {
+            self.validate_cross_module_signature_enum(module, expected, span)?;
+        }
         if sig.params.len() != args.len() {
             return Err(Diagnostic::type_error_at(
                 format!(
@@ -1082,6 +1144,7 @@ impl<'a> TypeChecker<'a> {
             ));
         }
         for (arg, expected) in args.iter().zip(sig.params.iter()) {
+            let expected = self.qualify_cross_module_type(module, expected);
             let actual = self.check_expr(arg, locals)?;
             if actual == TypeName::Void {
                 return Err(Diagnostic::type_error_at(
@@ -1089,18 +1152,139 @@ impl<'a> TypeChecker<'a> {
                     arg.span(),
                 ));
             }
-            if &actual != expected {
+            if actual != expected {
                 return Err(Diagnostic::type_error_at(
                     format!(
                         "argument type mismatch: expected {}, got {}",
-                        type_name_display(expected),
+                        type_name_display(&expected),
                         type_name_display(&actual)
                     ),
                     arg.span(),
                 ));
             }
         }
-        Ok(sig.return_type.clone())
+        Ok(self.qualify_cross_module_type(module, &sig.return_type))
+    }
+
+    fn validate_cross_module_signature_enum(
+        &self,
+        owner_module: &str,
+        ty: &TypeName,
+        span: Span,
+    ) -> XResult<()> {
+        let (enum_module, enum_name) = match ty {
+            TypeName::Named(name) => (owner_module, name.as_str()),
+            TypeName::Qualified { module, name } => (module.as_str(), name.as_str()),
+            _ => return Ok(()),
+        };
+        if enum_module == self.module_name {
+            return Ok(());
+        }
+        let module_exports = self.exports.get(enum_module).ok_or_else(|| {
+            Diagnostic::type_error_at(format!("unknown module `{enum_module}`"), span)
+        })?;
+        let Some(layout) = module_exports.enums.get(enum_name) else {
+            return Ok(());
+        };
+        if !layout.pub_export {
+            return Err(Diagnostic::type_error_at(
+                format!("cannot use private enum `{enum_name}` from module `{enum_module}`"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn qualify_cross_module_type(&self, owner_module: &str, ty: &TypeName) -> TypeName {
+        if owner_module == self.module_name {
+            return ty.clone();
+        }
+        match ty {
+            TypeName::Named(name) => {
+                if self
+                    .exports
+                    .get(owner_module)
+                    .and_then(|exports| exports.enums.get(name))
+                    .is_some()
+                {
+                    TypeName::Qualified {
+                        module: owner_module.to_owned(),
+                        name: name.clone(),
+                    }
+                } else {
+                    ty.clone()
+                }
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    fn is_enum_variant_constructor(&self, enum_ref: EnumRef<'_>, value: &Expr, span: Span) -> bool {
+        let Expr::Call { callee, .. } = value else {
+            return false;
+        };
+        self.resolve_enum_layout(enum_ref, span)
+            .ok()
+            .is_some_and(|layout| layout.variants.iter().any(|(name, _)| name == callee))
+    }
+
+    fn validate_signature_type(&self, ty: &TypeName, span: Span) -> XResult<()> {
+        match ty {
+            TypeName::I32 | TypeName::Bool | TypeName::Str | TypeName::Void => Ok(()),
+            TypeName::Array { .. } => Err(Diagnostic::type_error_at(
+                "array type not supported in function signatures yet",
+                span,
+            )),
+            TypeName::Named(name) => {
+                if self.is_known_enum(EnumRef::Local(name), span) {
+                    Ok(())
+                } else if self.structs.contains_key(name) {
+                    Err(Diagnostic::type_error_at(
+                        format!("struct type `{name}` is not supported in function signatures yet"),
+                        span,
+                    ))
+                } else {
+                    Err(Diagnostic::type_error_at(
+                        format!("unknown enum type `{name}`"),
+                        span,
+                    ))
+                }
+            }
+            TypeName::Qualified { module, name } => {
+                if module != self.module_name && !self.imports.contains(module) {
+                    return Err(Diagnostic::type_error_at(
+                        format!("unknown module `{module}`"),
+                        span,
+                    ));
+                }
+                let Some(module_exports) = self.exports.get(module) else {
+                    return Err(Diagnostic::type_error_at(
+                        format!("unknown module `{module}`"),
+                        span,
+                    ));
+                };
+                if self
+                    .exports
+                    .get(module)
+                    .is_some_and(|exports| exports.enums.contains_key(name))
+                {
+                    self.resolve_enum_layout(EnumRef::Qualified { module, name }, span)?;
+                    Ok(())
+                } else if module_exports.structs.contains_key(name) {
+                    Err(Diagnostic::type_error_at(
+                        format!(
+                            "struct type `{module}.{name}` is not supported in function signatures yet"
+                        ),
+                        span,
+                    ))
+                } else {
+                    Err(Diagnostic::type_error_at(
+                        format!("unknown enum type `{module}.{name}`"),
+                        span,
+                    ))
+                }
+            }
+        }
     }
 
     fn check_binary(
@@ -1437,7 +1621,10 @@ fn validate_main_across_unit(
     }
     if main_modules.len() > 1 {
         return Err(Diagnostic::type_error(
-            format!("multiple `main` functions found in modules: {}", main_modules.join(", ")),
+            format!(
+                "multiple `main` functions found in modules: {}",
+                main_modules.join(", ")
+            ),
             1,
             1,
         ));
@@ -1593,24 +1780,6 @@ fn validate_struct_field_type(
         }
         TypeName::Array { .. } => Err(Diagnostic::type_error_at(
             format!("array field types are not supported in struct `{struct_name}` yet"),
-            span,
-        )),
-    }
-}
-
-fn ensure_supported_signature_type(ty: &TypeName, span: Span) -> XResult<()> {
-    match ty {
-        TypeName::I32 | TypeName::Bool | TypeName::Str | TypeName::Void => Ok(()),
-        TypeName::Array { .. } => Err(Diagnostic::type_error_at(
-            "array type not supported in function signatures yet",
-            span,
-        )),
-        TypeName::Named(name) => Err(Diagnostic::type_error_at(
-            format!("struct type `{name}` is not supported in function signatures yet"),
-            span,
-        )),
-        TypeName::Qualified { module, name } => Err(Diagnostic::type_error_at(
-            format!("struct type `{module}.{name}` is not supported in function signatures yet"),
             span,
         )),
     }
