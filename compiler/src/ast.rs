@@ -103,6 +103,13 @@ pub enum Stmt {
         index: Expr,
         value: Expr,
     },
+    AssignField {
+        name: String,
+        name_span: Span,
+        field: String,
+        field_span: Span,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +155,16 @@ pub enum Expr {
         index: Box<Expr>,
         span: Span,
     },
+    StructLiteral {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
+        field_span: Span,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -161,7 +178,9 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::ArrayLiteral { span, .. }
-            | Expr::Index { span, .. } => *span,
+            | Expr::Index { span, .. }
+            | Expr::StructLiteral { span, .. }
+            | Expr::FieldAccess { span, .. } => *span,
         }
     }
 }

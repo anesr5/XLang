@@ -16,13 +16,20 @@ pub fn check(program: &Program) -> XResult<()> {
     TypeChecker::new(program)?.check_program(program)
 }
 
+#[derive(Debug, Clone)]
+struct StructLayout {
+    fields: Vec<(String, TypeName)>,
+}
+
 struct TypeChecker {
     functions: HashMap<String, FunctionSig>,
+    structs: HashMap<String, StructLayout>,
 }
 
 impl TypeChecker {
     fn new(program: &Program) -> XResult<Self> {
-        validate_structs(program)?;
+        let structs = build_struct_layouts(program)?;
+        validate_structs(program, &structs)?;
         let mut functions = HashMap::new();
         for function in &program.functions {
             if functions.contains_key(&function.name) {
@@ -46,7 +53,7 @@ impl TypeChecker {
             return Err(Diagnostic::type_error("program must define `main()`", 1, 1));
         }
         validate_main_signature(&functions)?;
-        Ok(Self { functions })
+        Ok(Self { functions, structs })
     }
 
     fn check_program(&self, program: &Program) -> XResult<()> {
@@ -121,43 +128,52 @@ impl TypeChecker {
                         annotation_span.unwrap_or(*name_span),
                     ));
                 }
-                if let Some(TypeName::Named(type_name)) = annotation {
-                    return Err(Diagnostic::type_error_at(
-                        format!(
-                            "struct type `{type_name}` is parsed but not supported for local values yet"
-                        ),
+                let binding_ty = if let Some(TypeName::Named(struct_name)) = annotation {
+                    validate_struct_local_type(
+                        &self.structs,
+                        struct_name,
                         annotation_span.unwrap_or(*name_span),
-                    ));
-                }
-                if let Some(array_ty) = annotation {
-                    validate_array_local_type(array_ty, annotation_span.unwrap_or(*name_span))?;
-                }
-                let value_ty = self.check_expr(value, locals)?;
-                if value_ty == TypeName::Void {
-                    return Err(Diagnostic::type_error_at(
-                        format!("cannot bind void value to `{name}`"),
-                        value.span(),
-                    ));
-                }
-                if let Some(annotation) = annotation
-                    && annotation != &value_ty
-                {
-                    if let (Some((_, expected_len)), TypeName::Array { len, .. }) =
-                        (annotation.array_elem_len(), &value_ty)
-                        && expected_len != *len
-                    {
+                    )?;
+                    if !matches!(value, Expr::StructLiteral { .. }) {
                         return Err(Diagnostic::type_error_at(
-                            format!(
-                                "array literal length mismatch: expected {expected_len} elements, got {len}"
-                            ),
+                            format!("struct local `{name}` requires a struct literal initializer"),
                             value.span(),
                         ));
                     }
-                    return Err(Diagnostic::type_error_at(
-                        format!("cannot assign {:?} to {:?}", value_ty, annotation),
-                        annotation_span.unwrap_or_else(|| value.span()),
-                    ));
-                }
+                    self.check_struct_literal(struct_name, value, locals)?;
+                    TypeName::Named(struct_name.clone())
+                } else {
+                    if let Some(array_ty) = annotation {
+                        validate_array_local_type(array_ty, annotation_span.unwrap_or(*name_span))?;
+                    }
+                    let value_ty = self.check_expr(value, locals)?;
+                    if value_ty == TypeName::Void {
+                        return Err(Diagnostic::type_error_at(
+                            format!("cannot bind void value to `{name}`"),
+                            value.span(),
+                        ));
+                    }
+                    if let Some(annotation) = annotation
+                        && annotation != &value_ty
+                    {
+                        if let (Some((_, expected_len)), TypeName::Array { len, .. }) =
+                            (annotation.array_elem_len(), &value_ty)
+                            && expected_len != *len
+                        {
+                            return Err(Diagnostic::type_error_at(
+                                format!(
+                                    "array literal length mismatch: expected {expected_len} elements, got {len}"
+                                ),
+                                value.span(),
+                            ));
+                        }
+                        return Err(Diagnostic::type_error_at(
+                            format!("cannot assign {:?} to {:?}", value_ty, annotation),
+                            annotation_span.unwrap_or_else(|| value.span()),
+                        ));
+                    }
+                    annotation.clone().unwrap_or(value_ty)
+                };
                 if declared.contains(name) {
                     return Err(Diagnostic::type_error_at(
                         format!("duplicate binding `{name}`"),
@@ -165,10 +181,7 @@ impl TypeChecker {
                     ));
                 }
                 declared.insert(name.clone());
-                locals.insert(
-                    name.clone(),
-                    (annotation.clone().unwrap_or(value_ty), *mutable),
-                );
+                locals.insert(name.clone(), (binding_ty, *mutable));
             }
             Stmt::Assign {
                 name,
@@ -188,9 +201,62 @@ impl TypeChecker {
                         *name_span,
                     ));
                 }
+                if matches!(target_ty, TypeName::Named(_)) {
+                    return Err(Diagnostic::type_error_at(
+                        format!("cannot assign to struct binding `{name}` as a whole"),
+                        *name_span,
+                    ));
+                }
+                if target_ty.array_elem_len().is_some() {
+                    return Err(Diagnostic::type_error_at(
+                        format!("cannot assign to array binding `{name}` as a whole"),
+                        *name_span,
+                    ));
+                }
                 if target_ty != &value_ty {
                     return Err(Diagnostic::type_error_at(
                         format!("cannot assign {:?} to {:?}", value_ty, target_ty),
+                        value.span(),
+                    ));
+                }
+            }
+            Stmt::AssignField {
+                name,
+                name_span,
+                field,
+                field_span,
+                value,
+            } => {
+                let Some((target_ty, mutable)) = locals.get(name) else {
+                    return Err(Diagnostic::type_error_at(
+                        format!("unknown variable `{name}`"),
+                        *name_span,
+                    ));
+                };
+                if !*mutable {
+                    return Err(Diagnostic::type_error_at(
+                        format!("cannot assign to field of const binding `{name}`"),
+                        *field_span,
+                    ));
+                }
+                let TypeName::Named(struct_name) = target_ty else {
+                    return Err(Diagnostic::type_error_at(
+                        format!(
+                            "cannot access field on value of type {}",
+                            type_name_display(target_ty)
+                        ),
+                        *field_span,
+                    ));
+                };
+                let (_, field_ty) = self.resolve_struct_field(struct_name, field, *field_span)?;
+                let value_ty = self.check_expr(value, locals)?;
+                if value_ty != *field_ty {
+                    return Err(Diagnostic::type_error_at(
+                        format!(
+                            "field assignment type mismatch: expected {}, got {}",
+                            type_name_display(field_ty),
+                            type_name_display(&value_ty)
+                        ),
                         value.span(),
                     ));
                 }
@@ -461,7 +527,110 @@ impl TypeChecker {
                 check_constant_index_in_bounds(index, len)?;
                 Ok(elem_ty.clone())
             }
+            Expr::StructLiteral { span, .. } => Err(Diagnostic::type_error_at(
+                "struct literals are only supported in struct bindings",
+                *span,
+            )),
+            Expr::FieldAccess {
+                base,
+                field,
+                field_span,
+                span: _,
+            } => {
+                let Expr::Variable {
+                    name,
+                    span: base_span,
+                } = base.as_ref()
+                else {
+                    return Err(Diagnostic::type_error_at(
+                        "field access base must be a variable",
+                        base.span(),
+                    ));
+                };
+                let Some((base_ty, _)) = locals.get(name) else {
+                    return Err(Diagnostic::type_error_at(
+                        format!("unknown variable `{name}`"),
+                        *base_span,
+                    ));
+                };
+                let TypeName::Named(struct_name) = base_ty else {
+                    return Err(Diagnostic::type_error_at(
+                        format!(
+                            "cannot access field on value of type {}",
+                            type_name_display(base_ty)
+                        ),
+                        *field_span,
+                    ));
+                };
+                let (_, field_ty) = self.resolve_struct_field(struct_name, field, *field_span)?;
+                Ok(field_ty.clone())
+            }
         }
+    }
+
+    fn check_struct_literal(
+        &self,
+        struct_name: &str,
+        value: &Expr,
+        locals: &HashMap<String, (TypeName, bool)>,
+    ) -> XResult<()> {
+        let Expr::StructLiteral { elements, span } = value else {
+            return Err(Diagnostic::type_error_at(
+                "expected struct literal",
+                value.span(),
+            ));
+        };
+        let layout = self.structs.get(struct_name).ok_or_else(|| {
+            Diagnostic::type_error_at(format!("unknown struct type `{struct_name}`"), *span)
+        })?;
+        if elements.len() != layout.fields.len() {
+            return Err(Diagnostic::type_error_at(
+                format!(
+                    "struct literal length mismatch: expected {} fields, got {}",
+                    layout.fields.len(),
+                    elements.len()
+                ),
+                *span,
+            ));
+        }
+        for (index, (element, (_, expected_ty))) in
+            elements.iter().zip(layout.fields.iter()).enumerate()
+        {
+            let actual_ty = self.check_expr(element, locals)?;
+            if actual_ty != *expected_ty {
+                return Err(Diagnostic::type_error_at(
+                    format!(
+                        "struct field {index} type mismatch: expected {}, got {}",
+                        type_name_display(expected_ty),
+                        type_name_display(&actual_ty)
+                    ),
+                    element.span(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_struct_field<'a>(
+        &'a self,
+        struct_name: &str,
+        field: &str,
+        span: Span,
+    ) -> XResult<(&'a str, &'a TypeName)> {
+        let layout = self.structs.get(struct_name).ok_or_else(|| {
+            Diagnostic::type_error_at(format!("unknown struct type `{struct_name}`"), span)
+        })?;
+        layout
+            .fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(name, ty)| (name.as_str(), ty))
+            .ok_or_else(|| {
+                Diagnostic::type_error_at(
+                    format!("struct `{struct_name}` has no field `{field}`"),
+                    span,
+                )
+            })
     }
 
     fn check_call(
@@ -583,6 +752,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
         Stmt::Let { .. }
         | Stmt::Assign { .. }
         | Stmt::AssignIndex { .. }
+        | Stmt::AssignField { .. }
         | Stmt::Expr(_)
         | Stmt::While { .. }
         | Stmt::Break { .. }
@@ -605,6 +775,7 @@ fn stmt_anchor_span(stmt: &Stmt) -> Span {
             ..
         } => annotation_span.unwrap_or(*name_span),
         Stmt::Assign { name_span, .. } | Stmt::AssignIndex { name_span, .. } => *name_span,
+        Stmt::AssignField { field_span, .. } => *field_span,
         Stmt::Return { keyword_span, .. } => *keyword_span,
         Stmt::Expr(expr) => expr.span(),
         Stmt::If { keyword_span, .. } | Stmt::While { keyword_span, .. } => *keyword_span,
@@ -674,12 +845,32 @@ fn type_name_display(ty: &TypeName) -> String {
     }
 }
 
-fn validate_structs(program: &Program) -> XResult<()> {
+fn build_struct_layouts(program: &Program) -> XResult<HashMap<String, StructLayout>> {
+    let mut structs = HashMap::new();
+    for struct_decl in &program.structs {
+        let fields = struct_decl
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.ty.clone()))
+            .collect();
+        structs.insert(struct_decl.name.clone(), StructLayout { fields });
+    }
+    Ok(structs)
+}
+
+fn validate_structs(program: &Program, layouts: &HashMap<String, StructLayout>) -> XResult<()> {
     let mut struct_names = HashSet::new();
     for struct_decl in &program.structs {
         if !struct_names.insert(struct_decl.name.clone()) {
             return Err(Diagnostic::type_error_at(
                 format!("duplicate struct `{}`", struct_decl.name),
+                struct_decl.name_span,
+            ));
+        }
+
+        if struct_decl.fields.is_empty() {
+            return Err(Diagnostic::type_error_at(
+                format!("struct `{}` must have at least one field", struct_decl.name),
                 struct_decl.name_span,
             ));
         }
@@ -695,9 +886,61 @@ fn validate_structs(program: &Program) -> XResult<()> {
                     field.name_span,
                 ));
             }
+            validate_struct_field_type(&struct_decl.name, &field.ty, field.ty_span, layouts)?;
         }
     }
     Ok(())
+}
+
+fn validate_struct_field_type(
+    struct_name: &str,
+    ty: &TypeName,
+    span: Span,
+    layouts: &HashMap<String, StructLayout>,
+) -> XResult<()> {
+    match ty {
+        TypeName::I32 | TypeName::Bool => Ok(()),
+        TypeName::Str => Err(Diagnostic::type_error_at(
+            format!("field type `str` is not supported in struct `{struct_name}` yet"),
+            span,
+        )),
+        TypeName::Void => Err(Diagnostic::type_error_at(
+            format!("field type cannot be void in struct `{struct_name}`"),
+            span,
+        )),
+        TypeName::Named(name) => {
+            if layouts.contains_key(name) {
+                Err(Diagnostic::type_error_at(
+                    format!("nested struct field type `{name}` is not supported yet"),
+                    span,
+                ))
+            } else {
+                Err(Diagnostic::type_error_at(
+                    format!("unknown type `{name}` in struct `{struct_name}`"),
+                    span,
+                ))
+            }
+        }
+        TypeName::Array { .. } => Err(Diagnostic::type_error_at(
+            format!("array field types are not supported in struct `{struct_name}` yet"),
+            span,
+        )),
+    }
+}
+
+fn validate_struct_local_type(
+    layouts: &HashMap<String, StructLayout>,
+    name: &str,
+    span: Span,
+) -> XResult<()> {
+    if layouts.contains_key(name) {
+        Ok(())
+    } else {
+        Err(Diagnostic::type_error_at(
+            format!("unknown struct type `{name}`"),
+            span,
+        ))
+    }
 }
 
 fn ensure_supported_signature_type(ty: &TypeName, span: Span) -> XResult<()> {

@@ -122,7 +122,7 @@ XLang/
 
 **v0.2 docs:** [release notes](docs/releases/v0.2.md) · [RFC-0014–0017](docs/rfcs/RFC-0014-v0-2-roadmap-and-scope.md) · [examples/v0.2/](examples/v0.2/)
 
-**v0.3 docs (draft RFCs):** [RFC-0018–0022](docs/rfcs/RFC-0018-v0-3-roadmap-and-scope.md) — struct layout, literals, field access, LLVM lowering
+**v0.3 docs:** [release notes](docs/releases/v0.3.md) · [RFC-0018–0022](docs/rfcs/RFC-0018-v0-3-roadmap-and-scope.md) · [examples/v0.3/](examples/v0.3/)
 
 ---
 
@@ -180,7 +180,7 @@ On Windows, `compiler/src/llvm_windows_shim.rs` provides stub symbols for LLVM t
 
 1. ~~Minimal grammar and bootstrap compiler~~
 2. ~~v0.2: loops and fixed-size arrays~~
-3. **v0.3 (in progress):** struct layout, literals, field access, LLVM lowering — [RFC-0018](docs/rfcs/RFC-0018-v0-3-roadmap-and-scope.md)
+3. ~~**v0.3:** struct layout, literals, field access, LLVM lowering~~
 4. Module system and imports
 5. Ownership, borrowing, and error values
 6. Concurrency and GPU support

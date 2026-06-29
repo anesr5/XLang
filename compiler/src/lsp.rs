@@ -32,6 +32,7 @@ pub struct Symbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceKind {
     Read,
+    Write,
     Call,
 }
 
@@ -333,6 +334,32 @@ fn index_block(
                 index_expr(index, idx, scope, alloc_id);
                 index_expr(index, value, scope, alloc_id);
             }
+            Stmt::AssignField {
+                name,
+                name_span,
+                field,
+                field_span,
+                value,
+            } => {
+                if let Some(symbol_id) = scope.get(name) {
+                    index.references.push(Reference {
+                        span: *name_span,
+                        symbol_id: *symbol_id,
+                        kind: ReferenceKind::Read,
+                    });
+                }
+                if let Some(local_ty) = resolve_local_type_from_scope(index, scope, name)
+                    && let TypeName::Named(struct_name) = local_ty
+                    && let Some(field_id) = find_struct_field_symbol(index, &struct_name, field)
+                {
+                    index.references.push(Reference {
+                        span: *field_span,
+                        symbol_id: field_id,
+                        kind: ReferenceKind::Write,
+                    });
+                }
+                index_expr(index, value, scope, alloc_id);
+            }
         }
     }
 }
@@ -386,7 +413,165 @@ fn index_expr(
             index_expr(index, base, scope, alloc_id);
             index_expr(index, idx, scope, alloc_id);
         }
+        Expr::StructLiteral { elements, .. } => {
+            for element in elements {
+                index_expr(index, element, scope, alloc_id);
+            }
+        }
+        Expr::FieldAccess {
+            base,
+            field,
+            field_span,
+            ..
+        } => index_field_reference(index, scope, base, field, *field_span, alloc_id),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberCompletionItem {
+    pub name: String,
+    pub ty: TypeName,
+    pub replace_start: usize,
+    pub replace_end: usize,
+}
+
+pub fn member_field_completions(
+    analysis: &AnalysisResult,
+    source: &str,
+    offset: usize,
+) -> Option<Vec<MemberCompletionItem>> {
+    let (base_name, prefix, replace_start, replace_end) = member_access_context(source, offset)?;
+    let local_ty = resolve_local_type_at_offset(&analysis.index, &base_name, offset)?;
+    let TypeName::Named(struct_name) = local_ty else {
+        return None;
+    };
+    let struct_decl = analysis
+        .program
+        .as_ref()?
+        .structs
+        .iter()
+        .find(|decl| decl.name == struct_name)?;
+
+    let items = struct_decl
+        .fields
+        .iter()
+        .filter(|field| field.name.starts_with(&prefix))
+        .map(|field| MemberCompletionItem {
+            name: field.name.clone(),
+            ty: field.ty.clone(),
+            replace_start,
+            replace_end,
+        })
+        .collect();
+    Some(items)
+}
+
+fn member_access_context(source: &str, offset: usize) -> Option<(String, String, usize, usize)> {
+    if source.is_empty() {
+        return None;
+    }
+    let index = offset.min(source.len());
+    let before = &source[..index];
+    let dot = before.rfind('.')?;
+    let after_dot = &before[dot + 1..];
+    if !after_dot.is_empty()
+        && !after_dot
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let base_end = dot;
+    let mut base_start = base_end;
+    while base_start > 0 && is_identifier_char(source.as_bytes()[base_start - 1]) {
+        base_start -= 1;
+    }
+    let base_name = source.get(base_start..base_end)?.to_owned();
+    if base_name.is_empty() {
+        return None;
+    }
+    Some((base_name, after_dot.to_owned(), dot + 1, index))
+}
+
+fn resolve_local_type_at_offset(
+    index: &SemanticIndex,
+    name: &str,
+    offset: usize,
+) -> Option<TypeName> {
+    index
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Variable { .. } | SymbolKind::Parameter
+            ) && symbol.name == name
+                && symbol.span.start_byte <= offset
+        })
+        .max_by_key(|symbol| symbol.span.start_byte)
+        .and_then(|symbol| symbol.ty.clone())
+}
+
+fn find_struct_field_symbol(
+    index: &SemanticIndex,
+    struct_name: &str,
+    field: &str,
+) -> Option<SymbolId> {
+    let struct_id = index.symbols.iter().find_map(|symbol| {
+        if symbol.kind == SymbolKind::Struct && symbol.name == struct_name {
+            Some(symbol.id)
+        } else {
+            None
+        }
+    })?;
+    index.symbols.iter().find_map(|symbol| {
+        if symbol.kind == SymbolKind::StructField
+            && symbol.parent == Some(struct_id)
+            && symbol.name == field
+        {
+            Some(symbol.id)
+        } else {
+            None
+        }
+    })
+}
+
+fn index_field_reference(
+    index: &mut SemanticIndex,
+    scope: &HashMap<String, SymbolId>,
+    base: &Expr,
+    field: &str,
+    field_span: Span,
+    alloc_id: &mut impl FnMut() -> SymbolId,
+) {
+    index_expr(index, base, scope, alloc_id);
+    let Expr::Variable { name, .. } = base else {
+        return;
+    };
+    let Some(local_ty) = resolve_local_type_from_scope(index, scope, name) else {
+        return;
+    };
+    let TypeName::Named(struct_name) = local_ty else {
+        return;
+    };
+    if let Some(field_id) = find_struct_field_symbol(index, &struct_name, field) {
+        index.references.push(Reference {
+            span: field_span,
+            symbol_id: field_id,
+            kind: ReferenceKind::Read,
+        });
+    }
+}
+
+fn resolve_local_type_from_scope(
+    index: &SemanticIndex,
+    scope: &HashMap<String, SymbolId>,
+    name: &str,
+) -> Option<TypeName> {
+    scope
+        .get(name)
+        .and_then(|id| index.symbol(*id))
+        .and_then(|symbol| symbol.ty.clone())
 }
 
 fn find_function(index: &SemanticIndex, name: &str) -> Option<SymbolId> {
@@ -437,7 +622,14 @@ pub fn build_hover_at_offset(ctx: &HoverContext<'_>) -> Option<String> {
         return Some(render_symbol_hover(ctx, symbol, Some(reference)));
     }
 
-    word_at_offset(ctx.source, ctx.offset).map(render_keyword_or_type_hover)
+    word_at_offset(ctx.source, ctx.offset).map(|word| {
+        if let Some(program) = ctx.program
+            && let Some(struct_decl) = find_struct_decl(program, word)
+        {
+            return render_struct_type_hover(struct_decl);
+        }
+        render_keyword_or_type_hover(word)
+    })
 }
 
 fn render_symbol_hover(
@@ -522,6 +714,15 @@ fn render_symbol_hover(
                     "immutable (`const`)"
                 }
             ));
+            if let (Some(TypeName::Named(struct_name)), Some(program)) =
+                (symbol.ty.as_ref(), ctx.program)
+                && let Some(struct_decl) = find_struct_decl(program, struct_name)
+            {
+                sections.push(render_field_list(&struct_decl.fields));
+                sections.push(String::from(
+                    "**Fields** — read with `.field`; assign with `.field = expr` on mutable bindings.",
+                ));
+            }
         }
         SymbolKind::Struct => {
             sections.push(format!("**Struct** `{}`", symbol.name));
@@ -537,7 +738,7 @@ fn render_symbol_hover(
                 sections.push(signature_block(&format!("struct {} {{ … }}", symbol.name)));
             }
             sections.push(String::from(
-                "**Status** — parsed only. Struct values, field access, and struct-typed signatures are not supported yet.",
+                "**Status** — struct locals, literals, and field access are supported in v0.3. Struct-typed function signatures are not supported yet.",
             ));
         }
         SymbolKind::StructField => {
@@ -554,6 +755,9 @@ fn render_symbol_hover(
                 sections.push(format!("Field of struct `{}`.", parent.name));
             }
             sections.push(format!("**Type** — `{ty}`"));
+            sections.push(String::from(
+                "**Usage** — `binding.field` to read; `binding.field = expr;` to write (mutable binding).",
+            ));
         }
         SymbolKind::TypeName => {
             if let Some(ty) = &symbol.ty {
@@ -602,6 +806,20 @@ fn render_keyword_or_type_hover(word: &str) -> String {
     sections.join("\n\n")
 }
 
+fn render_struct_type_hover(struct_decl: &StructDecl) -> String {
+    let mut sections = Vec::new();
+    sections.push(format!("**Struct type** `{}`", struct_decl.name));
+    sections.push(signature_block(&format_struct_decl(struct_decl)));
+    if !struct_decl.fields.is_empty() {
+        sections.push(render_field_list(&struct_decl.fields));
+    }
+    sections.push(String::from(
+        "**Usage** — `TypeName name = { … };` with a positional struct literal.",
+    ));
+    sections.push(String::from("**Codegen** — supported (scalar fields only)"));
+    sections.join("\n\n")
+}
+
 fn render_type_hover(name: &str, ty: &TypeName) -> Vec<String> {
     let mut sections = Vec::new();
     sections.push(format!("**Primitive type** `{name}`"));
@@ -640,6 +858,7 @@ fn render_reference_note(reference: &Reference) -> String {
     let action = match reference.kind {
         ReferenceKind::Call => "Function call",
         ReferenceKind::Read => "Read reference",
+        ReferenceKind::Write => "Write reference",
     };
     format!("**Usage** — {action}")
 }
@@ -741,7 +960,7 @@ fn type_summary(ty: &TypeName) -> Option<&'static str> {
         TypeName::Bool => Some("Boolean value (`true` or `false`), lowered as LLVM `i1`."),
         TypeName::Str => Some("String type accepted by the frontend; not lowered to LLVM in v0.1."),
         TypeName::Void => Some("Absence of value. Valid only as a function return type."),
-        TypeName::Named(_) => None,
+        TypeName::Named(_) => Some("User-defined struct type with stack-allocated locals (v0.3)."),
         TypeName::Array { elem, .. } => match elem.as_ref() {
             TypeName::I32 => Some("Fixed-size stack array of `i32` elements (v0.2)."),
             TypeName::Bool => Some("Fixed-size stack array of `bool` elements (v0.2)."),
@@ -759,7 +978,7 @@ fn type_usage(ty: &TypeName) -> Option<&'static str> {
             Some("**Usage** — expressions, locals, parameters, return types (frontend only)")
         }
         TypeName::Void => Some("**Usage** — function return type only"),
-        TypeName::Named(_) => None,
+        TypeName::Named(_) => Some("**Usage** — local bindings with struct literals"),
         TypeName::Array { .. } => Some("**Usage** — local bindings with array literals"),
     }
 }
@@ -770,7 +989,7 @@ fn type_codegen_note(ty: &TypeName) -> Option<&'static str> {
         TypeName::Str => {
             Some("**Codegen** — not supported (`x check` may pass, `x emit-llvm` fails)")
         }
-        TypeName::Named(_) => None,
+        TypeName::Named(_) => Some("**Codegen** — supported (scalar fields only)"),
         TypeName::Array { elem, .. } => match elem.as_ref() {
             TypeName::I32 | TypeName::Bool => Some("**Codegen** — supported (with bounds checks)"),
             _ => Some("**Codegen** — not supported"),
@@ -787,7 +1006,7 @@ fn keyword_documentation(keyword: &str) -> Option<&'static str> {
             "Declares a dependency name. Parsed for syntax only; cross-file resolution is not implemented.",
         ),
         "struct" => Some(
-            "Begins a struct declaration: `struct Name { type field; … }`. Struct values are not usable in expressions yet.",
+            "Begins a struct declaration: `struct Name { type field; … }`. Use struct types in local bindings with `{ … }` literals (v0.3).",
         ),
         "const" => Some(
             "Marks an immutable local binding: `const type name = expr;`. The binding cannot be reassigned.",
@@ -901,5 +1120,70 @@ i32 main() {
         .expect("hover text");
         assert!(hover.contains("**Primitive type** `i32`"));
         assert!(hover.contains("**Codegen** — supported"));
+    }
+
+    const STRUCT_DEMO: &str = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Vec2 p = { 3, 4 };
+    return p.x + p.y;
+}
+"#;
+
+    #[test]
+    fn hover_struct_field_shows_type_and_parent() {
+        let result = analyze_source(STRUCT_DEMO);
+        assert!(result.diagnostics.is_empty());
+        let offset = STRUCT_DEMO.find(".x").unwrap() + 1;
+        let hover = build_hover_at_offset(&HoverContext {
+            source: STRUCT_DEMO,
+            program: result.program.as_ref(),
+            index: &result.index,
+            offset,
+        })
+        .expect("hover text");
+        assert!(hover.contains("**Struct field** `x`"));
+        assert!(hover.contains("Field of struct `Vec2`"));
+    }
+
+    #[test]
+    fn hover_struct_type_name_in_binding() {
+        let result = analyze_source(STRUCT_DEMO);
+        let offset = STRUCT_DEMO.find("Vec2 p").unwrap();
+        let hover = build_hover_at_offset(&HoverContext {
+            source: STRUCT_DEMO,
+            program: result.program.as_ref(),
+            index: &result.index,
+            offset,
+        })
+        .expect("hover text");
+        assert!(hover.contains("**Struct type** `Vec2`"));
+    }
+
+    #[test]
+    fn member_field_completions_after_dot() {
+        let result = analyze_source(STRUCT_DEMO);
+        let offset = STRUCT_DEMO.find("p.x").unwrap() + 2;
+        let items = member_field_completions(&result, STRUCT_DEMO, offset).expect("completions");
+        let names: Vec<_> = items.iter().map(|item| item.name.as_str()).collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"y"));
+    }
+
+    #[test]
+    fn indexes_field_reference_for_goto_definition() {
+        let result = analyze_source(STRUCT_DEMO);
+        let offset = STRUCT_DEMO.find(".y").unwrap() + 1;
+        let reference = result
+            .index
+            .reference_at_offset(offset)
+            .expect("field reference");
+        let symbol = result.index.symbol(reference.symbol_id).expect("symbol");
+        assert_eq!(symbol.kind, SymbolKind::StructField);
+        assert_eq!(symbol.name, "y");
     }
 }

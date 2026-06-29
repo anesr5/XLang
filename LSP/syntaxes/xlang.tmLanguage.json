@@ -22,7 +22,7 @@
       "patterns": [
         {
           "name": "keyword.control.xlang",
-          "match": "\\b(module|import|struct|const|return|if|else|true|false)\\b"
+          "match": "\\b(module|import|struct|const|return|if|else|while|break|continue|true|false)\\b"
         }
       ]
     },

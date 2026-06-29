@@ -1,8 +1,8 @@
 # XLang Language Server
 
-Language Server Protocol implementation for [XLang](https://github.com/IWANABETHATGUY/tower-lsp-boilerplate) (`.x` files), based on [tower-lsp-boilerplate](https://github.com/IWANABETHATGUY/tower-lsp-boilerplate).
+Language Server Protocol implementation for [XLang](../README.md) (`.x` files).
 
-The server uses the XLang bootstrap compiler (`../compiler`) for parsing, type checking, and semantic analysis. It only exposes features supported by the **current v0.1 language subset** (see `../docs/spec/`).
+The server uses the XLang bootstrap compiler (`../compiler`) for parsing, type checking, and semantic analysis. It tracks the **v0.3 language subset** (see `../docs/releases/v0.3.md`).
 
 ## Features
 
@@ -10,14 +10,13 @@ The server uses the XLang bootstrap compiler (`../compiler`) for parsing, type c
 |---------|--------|
 | Diagnostics (lex / parse / type) | yes |
 | Semantic highlighting | yes |
-| Hover | yes |
+| Hover (functions, locals, structs, fields, types) | yes |
 | Completion (keywords, types, symbols) | yes |
+| **Struct field completion** (`p.` → fields) | yes (v0.3) |
 | Go to definition | yes |
-| Find references | yes |
+| Find references (including field reads/writes) | yes |
 | Rename | yes |
 | Format | not yet (no formatter in compiler) |
-| Inlay hints | not included (types are explicit in syntax) |
-| Struct field access completion | not yet (structs not usable in expressions) |
 
 ## Build the server
 
@@ -50,14 +49,20 @@ Set `SERVER_PATH` to the absolute path of `xlang-language-server` if it is not o
 
 ## Supported language surface
 
-Aligned with `docs/spec/` and RFC-0005 through RFC-0013:
+Aligned with `docs/releases/v0.3.md` and RFC-0014 through RFC-0022:
 
-- C-style functions: `i32 add(i32 a, i32 b) { … }`
-- C-style locals: `i32 x = 1;`, `const i32 x = 1;`
-- `if` / `else`, `return`, assignments
+- C-style functions and locals (`i32`, `bool`, struct types)
+- `if` / `else`, `while` / `break` / `continue`
+- Fixed-size arrays `T[N]`, index expressions
+- Struct declarations, struct locals, struct literals, field access and assignment
 - `module`, `import` (parsed; no cross-file resolution)
-- `struct` declarations (parsed only)
-- Types: `i32`, `bool`, `void`, `str` (frontend); codegen not required for LSP
+- Types: `i32`, `bool`, `void`, `str` (frontend); struct names in local bindings
+
+## Smoke test
+
+```bash
+python LSP/scripts/smoke_test.py
+```
 
 ## License
 

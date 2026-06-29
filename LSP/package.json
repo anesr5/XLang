@@ -1,7 +1,7 @@
 {
   "name": "xlang-language-server",
   "displayName": "XLang Language Server",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Language Server Protocol support for XLang (.x)",
   "publisher": "xlang",
   "license": "MIT",

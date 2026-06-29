@@ -4,10 +4,14 @@ use log::debug;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use x::{AnalysisResult, SymbolKind, analyze_source, build_hover_at_offset, format_type_name, HoverContext};
+use x::{
+    analyze_source, build_hover_at_offset, format_type_name, member_field_completions, AnalysisResult,
+    HoverContext, SymbolKind,
+};
 
 const KEYWORDS: &[&str] = &[
-    "module", "import", "struct", "const", "return", "if", "else", "true", "false",
+    "module", "import", "struct", "const", "return", "if", "else", "while", "break", "continue",
+    "true", "false",
 ];
 
 const TYPES: &[&str] = &["i32", "bool", "void", "str"];
@@ -25,7 +29,7 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "xlang-language-server".to_owned(),
-                version: Some("0.1.0".to_owned()),
+                version: Some("0.3.0".to_owned()),
             }),
             offset_encoding: None,
             capabilities: ServerCapabilities {
@@ -42,7 +46,7 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
-                    trigger_characters: None,
+                    trigger_characters: Some(vec![".".to_owned()]),
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
@@ -169,8 +173,9 @@ impl LanguageServer for Backend {
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri.to_string();
+        let position = params.text_document_position.position;
         Ok(self
-            .get_completion(&uri)
+            .get_completion(&uri, position)
             .map(CompletionResponse::Array))
     }
 
@@ -335,8 +340,37 @@ impl Backend {
         })
     }
 
-    fn get_completion(&self, uri: &str) -> Option<Vec<CompletionItem>> {
+    fn get_completion(&self, uri: &str, position: Position) -> Option<Vec<CompletionItem>> {
         let analysis = self.analysis_map.get(uri)?;
+        let rope = self.document_map.get(uri)?;
+        let offset = position_to_offset(position, &rope)?;
+        let source = rope.to_string();
+
+        if let Some(fields) = member_field_completions(&analysis, &source, offset) {
+            let mut items = Vec::new();
+            for field in fields {
+                let range = Range::new(
+                    offset_to_position(field.replace_start, &rope)?,
+                    offset_to_position(field.replace_end, &rope)?,
+                );
+                items.push(CompletionItem {
+                    label: field.name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(format!(
+                        "{} {}",
+                        format_type_name(&field.ty),
+                        field.name
+                    )),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range,
+                        new_text: field.name,
+                    })),
+                    ..Default::default()
+                });
+            }
+            return Some(items);
+        }
+
         let mut items = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -371,7 +405,7 @@ impl Backend {
                         .ty
                         .as_ref()
                         .map(format_type_name)
-                        .unwrap_or("void");
+                        .unwrap_or_else(|| "void".to_owned());
                     (
                         CompletionItemKind::FUNCTION,
                         Some(format!("{ret} {}()", symbol.name)),

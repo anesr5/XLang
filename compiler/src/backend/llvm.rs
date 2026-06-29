@@ -6,7 +6,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::targets::TargetTriple;
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue,
 };
@@ -35,14 +35,17 @@ struct LlvmEmitter<'ctx, 'program> {
     builder: Builder<'ctx>,
     program: &'program Program,
     functions: HashMap<&'program str, FunctionValue<'ctx>>,
+    struct_types: HashMap<String, StructType<'ctx>>,
 }
 
-struct FunctionEmitter<'emit, 'ctx> {
+struct FunctionEmitter<'emit, 'ctx, 'program> {
     context: &'ctx Context,
     builder: &'emit Builder<'ctx>,
     function: FunctionValue<'ctx>,
     functions: &'emit HashMap<&'emit str, FunctionValue<'ctx>>,
     module: &'emit Module<'ctx>,
+    program: &'program Program,
+    struct_types: &'emit HashMap<String, StructType<'ctx>>,
     locals: HashMap<String, Local<'ctx>>,
     loop_stack: Vec<LoopLabels<'ctx>>,
     terminated: bool,
@@ -78,11 +81,13 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
             builder: context.create_builder(),
             program,
             functions: HashMap::new(),
+            struct_types: HashMap::new(),
         }
     }
 
     fn emit_program(&mut self) -> XResult<String> {
         self.ensure_supported()?;
+        self.declare_struct_types()?;
         self.declare_functions()?;
         for function in &self.program.functions {
             self.emit_function(function)?;
@@ -94,6 +99,11 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
     }
 
     fn ensure_supported(&self) -> XResult<()> {
+        for struct_decl in &self.program.structs {
+            for field in &struct_decl.fields {
+                ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+            }
+        }
         for function in &self.program.functions {
             ensure_backend_type(
                 &function.return_type,
@@ -103,8 +113,26 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
                 ensure_backend_type(&param.ty, param.ty_span)?;
             }
             for stmt in &function.body {
-                ensure_stmt_supported(stmt)?;
+                ensure_stmt_supported(self.program, stmt)?;
             }
+        }
+        Ok(())
+    }
+
+    fn declare_struct_types(&mut self) -> XResult<()> {
+        for struct_decl in &self.program.structs {
+            let field_types = struct_decl
+                .fields
+                .iter()
+                .map(|field| llvm_scalar_type(self.context, &field.ty, field.ty_span))
+                .collect::<XResult<Vec<BasicTypeEnum<'ctx>>>>()?;
+            let struct_type = self
+                .context
+                .get_struct_type(&struct_decl.name)
+                .unwrap_or_else(|| self.context.opaque_struct_type(&struct_decl.name));
+            struct_type.set_body(&field_types, false);
+            self.struct_types
+                .insert(struct_decl.name.clone(), struct_type);
         }
         Ok(())
     }
@@ -146,6 +174,8 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
             function: function_value,
             functions: &self.functions,
             module: &self.module,
+            program: self.program,
+            struct_types: &self.struct_types,
             locals: HashMap::new(),
             loop_stack: Vec::new(),
             terminated: false,
@@ -206,7 +236,7 @@ fn host_target_triple() -> Option<&'static str> {
     TRIPLE
 }
 
-impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
+impl<'emit, 'ctx, 'program> FunctionEmitter<'emit, 'ctx, 'program> {
     fn emit_stmt(&mut self, stmt: &Stmt) -> XResult<()> {
         if self.terminated {
             return Ok(());
@@ -221,6 +251,8 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                 let source_span = value.span();
                 if let Some(TypeName::Array { elem, len }) = annotation {
                     self.emit_array_binding(name, elem, *len, value, source_span)?;
+                } else if let Some(TypeName::Named(struct_name)) = annotation {
+                    self.emit_struct_binding(name, struct_name, value, source_span)?;
                 } else {
                     let value = self.emit_expr(value)?;
                     let Some(value) = value else {
@@ -260,7 +292,42 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                         source_span,
                     ));
                 }
+                if matches!(local.ty, TypeName::Named(_)) {
+                    return Err(Diagnostic::backend_at(
+                        "cannot assign to struct binding as a whole",
+                        source_span,
+                    ));
+                }
                 build_unit(self.builder.build_store(local.pointer, value))?;
+            }
+            Stmt::AssignField {
+                name, field, value, ..
+            } => {
+                let (struct_ptr, struct_name) = {
+                    let local = self.locals.get(name).ok_or_else(|| {
+                        Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
+                    })?;
+                    let TypeName::Named(struct_name) = &local.ty else {
+                        return Err(Diagnostic::backend_at(
+                            "field assignment requires struct binding",
+                            value.span(),
+                        ));
+                    };
+                    (local.pointer, struct_name.clone())
+                };
+                let field_index = struct_field_index(self.program, &struct_name, field)?;
+                let field_ty = struct_field_type(self.program, &struct_name, field_index)?;
+                let stored = self.emit_expr(value)?;
+                let Some(stored) = stored else {
+                    return Err(Diagnostic::backend_at(
+                        "cannot assign void value",
+                        value.span(),
+                    ));
+                };
+                let field_ptr =
+                    self.emit_struct_field_ptr(struct_ptr, &struct_name, field_index)?;
+                build_unit(self.builder.build_store(field_ptr, stored))?;
+                let _ = field_ty;
             }
             Stmt::AssignIndex {
                 name, index, value, ..
@@ -425,6 +492,62 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
         Ok(())
     }
 
+    fn emit_struct_binding(
+        &mut self,
+        name: &str,
+        struct_name: &str,
+        value: &Expr,
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<()> {
+        let struct_ty = self.struct_types.get(struct_name).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown struct type `{struct_name}`"), source_span)
+        })?;
+        let slot = build_value(self.builder.build_alloca(*struct_ty, name))?;
+        let Expr::StructLiteral { elements, .. } = value else {
+            return Err(Diagnostic::backend_at(
+                "struct binding requires struct literal initializer",
+                source_span,
+            ));
+        };
+        for (index, element) in elements.iter().enumerate() {
+            let rendered = self.emit_expr(element)?;
+            let Some(rendered) = rendered else {
+                return Err(Diagnostic::backend_at(
+                    "cannot initialize struct with void value",
+                    element.span(),
+                ));
+            };
+            let field_ptr = self.emit_struct_field_ptr(slot, struct_name, index)?;
+            build_unit(self.builder.build_store(field_ptr, rendered))?;
+        }
+        self.locals.insert(
+            name.to_owned(),
+            Local {
+                pointer: slot,
+                ty: TypeName::Named(struct_name.to_owned()),
+                scalar_ty: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn emit_struct_field_ptr(
+        &mut self,
+        struct_ptr: PointerValue<'ctx>,
+        struct_name: &str,
+        field_index: usize,
+    ) -> XResult<PointerValue<'ctx>> {
+        let struct_ty = self.struct_types.get(struct_name).ok_or_else(|| {
+            Diagnostic::backend(format!("unknown struct type `{struct_name}`"), 1, 1)
+        })?;
+        let zero = self.context.i32_type().const_int(0, false);
+        let index = self.context.i32_type().const_int(field_index as u64, false);
+        build_value(unsafe {
+            self.builder
+                .build_gep(*struct_ty, struct_ptr, &[zero, index], "struct.field")
+        })
+    }
+
     fn emit_bounds_check(
         &mut self,
         index: inkwell::values::IntValue<'ctx>,
@@ -577,8 +700,14 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                     Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
                 })?;
                 let Some(scalar_ty) = local.scalar_ty else {
+                    if local.ty.array_elem_len().is_some() {
+                        return Err(Diagnostic::backend_at(
+                            "cannot use array binding as scalar value",
+                            *span,
+                        ));
+                    }
                     return Err(Diagnostic::backend_at(
-                        "cannot use array binding as scalar value",
+                        "cannot use struct binding as scalar value",
                         *span,
                     ));
                 };
@@ -640,6 +769,49 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                     scalar_ty,
                     elem_ptr,
                     "index.load",
+                ))?))
+            }
+            Expr::StructLiteral { span, .. } => Err(Diagnostic::backend_at(
+                "struct literals are only supported in struct bindings",
+                *span,
+            )),
+            Expr::FieldAccess {
+                base,
+                field,
+                field_span,
+                span: _,
+            } => {
+                let Expr::Variable {
+                    name,
+                    span: base_span,
+                } = base.as_ref()
+                else {
+                    return Err(Diagnostic::backend_at(
+                        "field access base must be a variable",
+                        base.span(),
+                    ));
+                };
+                let (struct_ptr, struct_name) = {
+                    let local = self.locals.get(name).ok_or_else(|| {
+                        Diagnostic::backend_at(format!("unknown variable `{name}`"), *base_span)
+                    })?;
+                    let TypeName::Named(struct_name) = &local.ty else {
+                        return Err(Diagnostic::backend_at(
+                            "field access requires struct binding",
+                            *field_span,
+                        ));
+                    };
+                    (local.pointer, struct_name.clone())
+                };
+                let field_index = struct_field_index(self.program, &struct_name, field)?;
+                let field_ty = struct_field_type(self.program, &struct_name, field_index)?;
+                let field_ptr =
+                    self.emit_struct_field_ptr(struct_ptr, &struct_name, field_index)?;
+                let scalar_ty = llvm_scalar_type(self.context, &field_ty, *field_span)?;
+                Ok(Some(build_value(self.builder.build_load(
+                    scalar_ty,
+                    field_ptr,
+                    "field.load",
                 ))?))
             }
         }
@@ -797,13 +969,13 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
     }
 }
 
-fn ensure_stmt_supported(stmt: &Stmt) -> XResult<()> {
+fn ensure_stmt_supported(program: &Program, stmt: &Stmt) -> XResult<()> {
     match stmt {
         Stmt::Let {
             value, annotation, ..
         } => {
             if let Some(ty) = annotation {
-                ensure_local_type_supported(ty, value.span())?;
+                ensure_local_type_supported(program, ty, value.span())?;
             }
             ensure_expr_supported(value)
         }
@@ -819,10 +991,11 @@ fn ensure_stmt_supported(stmt: &Stmt) -> XResult<()> {
         } => {
             ensure_expr_supported(condition)?;
             for stmt in body {
-                ensure_stmt_supported(stmt)?;
+                ensure_stmt_supported(program, stmt)?;
             }
             Ok(())
         }
+        Stmt::AssignField { value, .. } => ensure_expr_supported(value),
         Stmt::AssignIndex { index, value, .. } => {
             ensure_expr_supported(index)?;
             ensure_expr_supported(value)
@@ -835,7 +1008,7 @@ fn ensure_stmt_supported(stmt: &Stmt) -> XResult<()> {
         } => {
             ensure_expr_supported(condition)?;
             for stmt in then_body.iter().chain(else_body.iter()) {
-                ensure_stmt_supported(stmt)?;
+                ensure_stmt_supported(program, stmt)?;
             }
             Ok(())
         }
@@ -863,10 +1036,32 @@ fn ensure_expr_supported(expr: &Expr) -> XResult<()> {
             }
             Ok(())
         }
+        Expr::StructLiteral { elements, .. } => {
+            for element in elements {
+                ensure_expr_supported(element)?;
+            }
+            Ok(())
+        }
+        Expr::FieldAccess { base, .. } => ensure_expr_supported(base),
         Expr::Index { base, index, .. } => {
             ensure_expr_supported(base)?;
             ensure_expr_supported(index)
         }
+    }
+}
+
+fn ensure_struct_field_backend_type(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
+    match ty {
+        TypeName::I32 | TypeName::Bool => Ok(()),
+        TypeName::Str => Err(Diagnostic::backend_at(
+            "LLVM backend does not support struct field type str",
+            span,
+        )),
+        TypeName::Named(_) => Err(Diagnostic::backend_at(
+            "LLVM backend does not support nested struct fields yet",
+            span,
+        )),
+        TypeName::Void | TypeName::Array { .. } => Err(unsupported_backend_type(span)),
     }
 }
 
@@ -882,11 +1077,77 @@ fn ensure_array_element_backend_type(
     }
 }
 
-fn ensure_local_type_supported(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
+fn ensure_local_type_supported(
+    program: &Program,
+    ty: &TypeName,
+    span: crate::diagnostic::Span,
+) -> XResult<()> {
     match ty {
         TypeName::I32 | TypeName::Bool | TypeName::Void => Ok(()),
         TypeName::Array { elem, .. } => ensure_array_element_backend_type(elem, span),
-        TypeName::Str | TypeName::Named(_) => Err(unsupported_backend_type(span)),
+        TypeName::Named(name) => {
+            let Some(struct_decl) = program.structs.iter().find(|s| s.name == *name) else {
+                return Err(Diagnostic::backend_at(
+                    format!("unknown struct type `{name}`"),
+                    span,
+                ));
+            };
+            for field in &struct_decl.fields {
+                ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+            }
+            Ok(())
+        }
+        TypeName::Str => Err(unsupported_backend_type(span)),
+    }
+}
+
+fn struct_field_index(program: &Program, struct_name: &str, field: &str) -> XResult<usize> {
+    let struct_decl = program
+        .structs
+        .iter()
+        .find(|s| s.name == struct_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{struct_name}`"), 1, 1))?;
+    struct_decl
+        .fields
+        .iter()
+        .position(|f| f.name == field)
+        .ok_or_else(|| {
+            Diagnostic::backend(
+                format!("struct `{struct_name}` has no field `{field}`"),
+                1,
+                1,
+            )
+        })
+}
+
+fn struct_field_type(
+    program: &Program,
+    struct_name: &str,
+    field_index: usize,
+) -> XResult<TypeName> {
+    let struct_decl = program
+        .structs
+        .iter()
+        .find(|s| s.name == struct_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{struct_name}`"), 1, 1))?;
+    struct_decl
+        .fields
+        .get(field_index)
+        .map(|field| field.ty.clone())
+        .ok_or_else(|| {
+            Diagnostic::backend(format!("invalid field index for `{struct_name}`"), 1, 1)
+        })
+}
+
+fn llvm_scalar_type<'ctx>(
+    context: &'ctx Context,
+    ty: &TypeName,
+    span: crate::diagnostic::Span,
+) -> XResult<BasicTypeEnum<'ctx>> {
+    match ty {
+        TypeName::I32 => Ok(context.i32_type().as_basic_type_enum()),
+        TypeName::Bool => Ok(context.bool_type().as_basic_type_enum()),
+        _ => Err(unsupported_backend_type(span)),
     }
 }
 

@@ -16,8 +16,9 @@ pub use compile::{
 };
 pub use diagnostic::{Diagnostic, DiagnosticCode, Span, XResult};
 pub use lsp::{
-    AnalysisResult, HoverContext, ReferenceKind, SemanticIndex, Symbol, SymbolId, SymbolKind,
-    analyze_source, build_hover_at_offset, format_type_name, hover_markdown,
+    AnalysisResult, HoverContext, MemberCompletionItem, ReferenceKind, SemanticIndex, Symbol,
+    SymbolId, SymbolKind, analyze_source, build_hover_at_offset, format_type_name, hover_markdown,
+    member_field_completions,
 };
 
 #[cfg(test)]
@@ -781,22 +782,33 @@ i32 main() {
     }
 
     #[test]
-    fn rejects_named_local_type_at_type_span() {
+    fn rejects_unknown_struct_local_type() {
         let source = r#"
-struct Player {
-    i32 hp;
-}
-
 i32 main() {
-    Player player = 0;
+    Vec3 p = { 1, 2, 3 };
     return 0;
 }
 "#;
         let err = compile::check_source(source).unwrap_err();
         assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
-        assert!(err.message.contains("not supported for local values"));
-        assert_eq!(err.span.start_line, 7);
-        assert_eq!(err.span.start_column, 5);
+        assert!(err.message.contains("unknown struct type `Vec3`"));
+    }
+
+    #[test]
+    fn rejects_struct_local_without_initializer() {
+        let source = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Vec2 p;
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("expected `=` in binding"));
     }
 
     #[test]
@@ -1349,6 +1361,152 @@ i32 main() {
     return total;
 }
 "#;
+        compile::check_source(SOURCE).unwrap();
+        compile::emit_llvm_source(SOURCE).unwrap();
+    }
+
+    #[test]
+    fn accepts_struct_local_with_field_access() {
+        let source = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Vec2 p = { 3, 4 };
+    i32 sum = p.x + p.y;
+    p.y = 10;
+    return sum;
+}
+"#;
+        compile::check_source(source).unwrap();
+        let llvm_ir = compile::emit_llvm_source(source).unwrap();
+        assert!(llvm_ir.contains("%Vec2 = type"));
+        assert!(llvm_ir.contains("field.load"));
+    }
+
+    #[test]
+    fn rejects_empty_struct() {
+        let source = r#"
+struct Empty {
+}
+
+i32 main() {
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("must have at least one field"));
+    }
+
+    #[test]
+    fn rejects_struct_literal_length_mismatch() {
+        let source = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Vec2 p = { 1 };
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("struct literal length mismatch"));
+    }
+
+    #[test]
+    fn rejects_struct_field_type_mismatch() {
+        let source = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Vec2 p = { true, 1 };
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("struct field 0 type mismatch"));
+    }
+
+    #[test]
+    fn rejects_field_access_on_scalar() {
+        let source = r#"
+i32 main() {
+    i32 x = 0;
+    i32 y = x.y;
+    return y;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("cannot access field on value of type"));
+    }
+
+    #[test]
+    fn rejects_unknown_struct_field() {
+        let source = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    Vec2 p = { 0, 0 };
+    return p.z;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("has no field `z`"));
+    }
+
+    #[test]
+    fn rejects_const_struct_field_assign() {
+        let source = r#"
+struct Vec2 {
+    i32 x;
+    i32 y;
+}
+
+i32 main() {
+    const Vec2 p = { 0, 0 };
+    p.x = 1;
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(
+            err.message
+                .contains("cannot assign to field of const binding")
+        );
+    }
+
+    #[test]
+    fn rejects_nested_struct_field_type() {
+        let source = r#"
+struct Inner {
+    i32 x;
+}
+
+struct Outer {
+    Inner inner;
+}
+
+i32 main() {
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("nested struct field type"));
+    }
+
+    #[test]
+    fn v0_3_demo_program_returns_expected_sum() {
+        const SOURCE: &str = include_str!("../../examples/v0.3/main.x");
         compile::check_source(SOURCE).unwrap();
         compile::emit_llvm_source(SOURCE).unwrap();
     }

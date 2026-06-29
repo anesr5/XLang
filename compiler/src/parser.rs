@@ -175,6 +175,24 @@ impl Parser {
             return self.parse_binding(true, "expected binding name after type");
         }
         if let Some((name, name_span)) = self.peek_identifier()
+            && self.peek_next_kind_is(&TokenKind::Dot)
+        {
+            self.advance();
+            self.advance();
+            let (field, field_span) =
+                self.expect_identifier_with_span("expected field name after `.`")?;
+            self.expect(TokenKind::Equal, "expected `=` in field assignment")?;
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon, "expected `;` after assignment")?;
+            return Ok(Stmt::AssignField {
+                name,
+                name_span,
+                field,
+                field_span,
+                value,
+            });
+        }
+        if let Some((name, name_span)) = self.peek_identifier()
             && self.peek_next_kind_is(&TokenKind::LeftBracket)
         {
             self.advance();
@@ -216,7 +234,11 @@ impl Parser {
         let (annotation, annotation_span) = self.parse_type_with_span()?;
         let (name, name_span) = self.expect_identifier_with_span(name_message)?;
         self.expect(TokenKind::Equal, "expected `=` in binding")?;
-        let value = self.parse_expr()?;
+        let value = if matches!(annotation, TypeName::Named(_)) {
+            self.parse_struct_literal()?
+        } else {
+            self.parse_expr()?
+        };
         self.expect(TokenKind::Semicolon, "expected `;` after binding")?;
         Ok(Stmt::Let {
             mutable,
@@ -225,6 +247,26 @@ impl Parser {
             annotation: Some(annotation),
             annotation_span: Some(annotation_span),
             value,
+        })
+    }
+
+    fn parse_struct_literal(&mut self) -> XResult<Expr> {
+        self.expect(TokenKind::LeftBrace, "expected `{` to start struct literal")?;
+        let start = self.tokens[self.index - 1].span;
+        let mut elements = Vec::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                elements.push(self.parse_expr()?);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let end = self.current().span;
+        self.expect(TokenKind::RightBrace, "expected `}` after struct literal")?;
+        Ok(Expr::StructLiteral {
+            elements,
+            span: start.join(end),
         })
     }
 
@@ -432,16 +474,30 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self, mut expr: Expr) -> XResult<Expr> {
-        while self.match_token(&TokenKind::LeftBracket) {
-            let index = self.parse_expr()?;
-            let end = self.current().span;
-            self.expect(TokenKind::RightBracket, "expected `]` after index")?;
-            let span = expr.span().join(index.span()).join(end);
-            expr = Expr::Index {
-                base: Box::new(expr),
-                index: Box::new(index),
-                span,
-            };
+        loop {
+            if self.match_token(&TokenKind::LeftBracket) {
+                let index = self.parse_expr()?;
+                let end = self.current().span;
+                self.expect(TokenKind::RightBracket, "expected `]` after index")?;
+                let span = expr.span().join(index.span()).join(end);
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    index: Box::new(index),
+                    span,
+                };
+            } else if self.match_token(&TokenKind::Dot) {
+                let (field, field_span) =
+                    self.expect_identifier_with_span("expected field name after `.`")?;
+                let span = expr.span().join(field_span);
+                expr = Expr::FieldAccess {
+                    base: Box::new(expr),
+                    field,
+                    field_span,
+                    span,
+                };
+            } else {
+                break;
+            }
         }
         Ok(expr)
     }
