@@ -19,7 +19,7 @@ On Windows, set `LLVM_HOME` if LLVM is not installed at `C:\Program Files\LLVM`.
 ### Build and run the demo
 
 ```bash
-cargo run --manifest-path compiler/Cargo.toml -- run examples/main.x
+cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.1/main.x
 echo $?    # Linux/macOS — expect 42
 echo %ERRORLEVEL%  # Windows — expect 42
 ```
@@ -71,12 +71,12 @@ What works today:
 ```xlang
 module main
 
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 
-fn main() -> i32 {
-    let x = add(40, 2);
+i32 main() {
+    i32 x = add(40, 2);
     return x;
 }
 ```
@@ -85,7 +85,7 @@ fn main() -> i32 {
 |---------|:--------:|:------------:|
 | `i32`, `bool`, `void` | yes | yes |
 | Functions, calls, `return` | yes | yes |
-| `let` / `var` / `const`, assignments | yes | yes |
+| C-style local declarations, `const`, assignments | yes | yes |
 | `if` / `else` | yes | yes |
 | Arithmetic, comparison, `&&`, `\|\|` | yes | yes |
 | `module`, `import` (syntax only) | parsed | — |
@@ -95,8 +95,9 @@ fn main() -> i32 {
 Rules that matter in v0.1:
 
 - Executable statements end with `;` (newlines do not terminate statements).
-- `main` must be `fn main() -> i32` with no parameters.
-- `let` and `const` are immutable; use `var` for mutable bindings.
+- Functions use C-style syntax: `return_type name(type param, …) { … }` (e.g. `i32 add(i32 a, i32 b)`).
+- `main` must be `i32 main()` with no parameters.
+- Local declarations use C-style syntax: `i32 x = 1;` creates a mutable local; `const i32 x = 1;` creates an immutable local.
 - The backend uses direct LLVM lowering through [Inkwell 0.9](https://github.com/TheDan64/inkwell) (LLVM 22.1). There is **no C backend** and no C-as-IR stage.
 
 ---
@@ -105,20 +106,21 @@ Rules that matter in v0.1:
 
 ```text
 XLang/
-├── docs/rfcs/          Language specification (RFC-0001 … RFC-0006)
 ├── compiler/           Bootstrap compiler (Rust crate `x`)
-│   └── src/
-│       ├── lexer.rs    Tokenization
-│       ├── parser.rs   Recursive descent + Pratt expressions
-│       ├── typeck.rs   Semantic analysis
-│       ├── backend/    Inkwell LLVM IR lowering
-│       └── compile.rs  Pipeline orchestration
-├── examples/           Sample programs
-│   ├── main.x
-│   ├── invalid_missing_semicolon.x
-│   └── invalid_immutable_assignment.x
+├── LSP/                Experimental language server + VS Code extension
+├── docs/
+│   ├── releases/       Release notes (v0.1.md)
+│   ├── spec/           Language reference (v0.1-language-reference.md)
+│   ├── compiler/       Compiler architecture (v0.1-architecture.md)
+│   └── rfcs/           Long-term specification drafts
+├── examples/
+│   └── v0.1/           Canonical v0.1 sample programs
 └── build/              Generated IR and binaries (gitignored)
 ```
+
+**v0.1 docs:** [release notes](docs/releases/v0.1.md) · [language reference](docs/spec/v0.1-language-reference.md) · [compiler architecture](docs/compiler/v0.1-architecture.md)
+
+**v0.2 docs:** [release notes](docs/releases/v0.2.md) · [RFC-0014–0017](docs/rfcs/RFC-0014-v0-2-roadmap-and-scope.md) · [examples/v0.2/](examples/v0.2/)
 
 ---
 
@@ -132,6 +134,17 @@ XLang/
 | [RFC-0004](docs/rfcs/RFC-0004-lexical-grammar.md) | Lexical grammar |
 | [RFC-0005](docs/rfcs/RFC-0005-concrete-grammar-ebnf.md) | Concrete grammar (EBNF) |
 | [RFC-0006](docs/rfcs/RFC-0006-llvm-ir-lowering-rules.md) | LLVM IR lowering rules |
+| [RFC-0007](docs/rfcs/RFC-0007-variables-mutability-and-assignment.md) | Variables, mutability, and assignment |
+| [RFC-0008](docs/rfcs/RFC-0008-primitive-types.md) | Primitive types |
+| [RFC-0009](docs/rfcs/RFC-0009-expressions-and-operator-precedence.md) | Expressions and operator precedence |
+| [RFC-0010](docs/rfcs/RFC-0010-statements-and-blocks.md) | Statements and blocks |
+| [RFC-0011](docs/rfcs/RFC-0011-functions-and-calling-conventions.md) | Functions and calling conventions |
+| [RFC-0012](docs/rfcs/RFC-0012-modules-and-imports.md) | Modules and imports |
+| [RFC-0013](docs/rfcs/RFC-0013-diagnostics-and-error-codes.md) | Diagnostics and error codes |
+| [RFC-0014](docs/rfcs/RFC-0014-v0-2-roadmap-and-scope.md) | v0.2 roadmap and scope |
+| [RFC-0015](docs/rfcs/RFC-0015-while-loops-break-and-continue.md) | While loops, break, continue |
+| [RFC-0016](docs/rfcs/RFC-0016-fixed-size-arrays.md) | Fixed-size stack arrays |
+| [RFC-0017](docs/rfcs/RFC-0017-index-expressions-and-bounds-checking.md) | Index expressions and bounds checking |
 
 All RFCs are currently **Draft**.
 
@@ -140,7 +153,7 @@ All RFCs are currently **Draft**.
 ## Development
 
 ```bash
-# run the test suite (39 unit tests: lexer, parser, typeck, LLVM snapshots, diagnostics)
+# run the test suite (unit tests: lexer, parser, typeck, LLVM snapshots, diagnostics)
 cargo test --manifest-path compiler/Cargo.toml
 ```
 
@@ -150,6 +163,7 @@ Engineering constraints for the MVP:
 - `Module::verify()` gate before any IR is printed, written, or linked
 - LLVM IR snapshot tests with pinned target triples
 - No generated C artifacts in the backend path
+- CI runs formatting, clippy with warnings denied, and the Rust test suite
 
 On Windows, `compiler/src/llvm_windows_shim.rs` provides stub symbols for LLVM target initialization entry points missing from the official Windows LLVM installer layout.
 
@@ -157,7 +171,7 @@ On Windows, `compiler/src/llvm_windows_shim.rs` provides stub symbols for LLVM t
 
 ## Roadmap (high level)
 
-1. ~~Minimal grammar and bootstrap compiler~~ (in progress)
+1. ~~Minimal grammar and bootstrap compiler~~
 2. Struct layout, construction, and field access
 3. Module system and imports
 4. Ownership, borrowing, and error values

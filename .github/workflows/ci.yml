@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compiler:
+    name: Compiler quality gates
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "22.1"
+
+      - name: Format
+        env:
+          LLVM_HOME: ${{ env.LLVM_PATH }}
+        run: cargo fmt --manifest-path compiler/Cargo.toml -- --check
+
+      - name: Clippy
+        env:
+          LLVM_HOME: ${{ env.LLVM_PATH }}
+        run: cargo clippy --manifest-path compiler/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test
+        env:
+          LLVM_HOME: ${{ env.LLVM_PATH }}
+        run: cargo test --manifest-path compiler/Cargo.toml

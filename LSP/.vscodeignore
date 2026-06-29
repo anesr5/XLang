@@ -1,0 +1,15 @@
+.vscode
+node_modules
+out/
+src/
+tsconfig.json
+rolldown.config.mjs
+client/**
+target
+Cargo.lock
+.github
+.cargo
+examples/
+justfile
+rust-toolchains.toml
+

@@ -49,7 +49,7 @@ module main
 
 import io
 
-fn main() -> i32 {
+i32 main() {
     io.println("Hello, XLang");
     return 0;
 }
@@ -62,15 +62,15 @@ fn main() -> i32 {
 Function declaration:
 
 ```xlang
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 ```
 
-Void-like functions may omit the return type or explicitly use `void`.
+Void functions explicitly use `void`.
 
 ```xlang
-fn log(message: str) {
+void log(str message) {
     print(message);
 }
 ```
@@ -79,29 +79,28 @@ fn log(message: str) {
 
 ## 4. Variables
 
-Immutable binding:
+Mutable local declaration:
 
 ```xlang
-let hp = 100;
+i32 hp = 100;
 ```
 
-Mutable binding:
+Assignment:
 
 ```xlang
-var hp = 100;
 hp = hp - 10;
 ```
 
-Constant:
+Immutable local declaration:
 
 ```xlang
-const MAX_HP = 100;
+const i32 max_hp = 100;
 ```
 
-Type annotation:
+Local declarations are type-first and require an initializer in v0.1.
 
 ```xlang
-let hp: i32 = 100;
+i32 hp = 100;
 ```
 
 Dangerous implicit conversions are not allowed.
@@ -109,13 +108,13 @@ Dangerous implicit conversions are not allowed.
 Invalid:
 
 ```xlang
-let x: i32 = 3.14;
+i32 x = 3.14;
 ```
 
 Valid:
 
 ```xlang
-let x: i32 = cast<i32>(3.14);
+i32 x = cast<i32>(3.14);
 ```
 
 ---
@@ -126,8 +125,8 @@ Struct declaration:
 
 ```xlang
 struct Player {
-    hp: i32;
-    name: String;
+    i32 hp;
+    String name;
 }
 ```
 
@@ -136,7 +135,7 @@ Struct field declarations use semicolons because newlines are not statement or f
 Struct construction:
 
 ```xlang
-let player = Player {
+Player player = Player {
     hp: 100;
     name: String.from("Ava");
 };
@@ -228,12 +227,12 @@ for item in items {
 XLang v0.1 requires semicolons after executable statements and expression statements.
 
 ```xlang
-let x = 10;
-let y = 20;
+i32 x = 10;
+i32 y = 20;
 return x + y;
 ```
 
-Semicolons are not required after structural declarations or block constructs such as `module`, `import`, `fn`, `struct`, `enum`, `if`, `while`, `loop`, or `match`, unless a future grammar allows one of those constructs to appear as an expression statement. Struct field declarations are semicolon-terminated inside the struct body.
+Semicolons are not required after structural declarations or block constructs such as `module`, `import`, function declarations, `struct`, `enum`, `if`, `while`, `loop`, or `match`, unless a future grammar allows one of those constructs to appear as an expression statement. Struct field declarations are semicolon-terminated inside the struct body.
 
 ---
 
@@ -257,7 +256,7 @@ Documentation comment:
 
 ```xlang
 /// Adds two integers.
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 ```
@@ -278,9 +277,9 @@ struct
 enum
 trait
 
+const
 let
 var
-const
 
 if
 else
@@ -320,7 +319,7 @@ sizeof
 alignof
 ```
 
-Decision for v0.1: avoid `interface` and use only `trait`.
+Decision for v0.1: avoid `interface` and use only `trait`. There is no `fn`, `let`, or `var` keyword — functions and locals use C-style syntax (`i32 name(…)`, `i32 x = …;`, `const i32 x = …;`).
 
 ---
 
@@ -329,10 +328,10 @@ Decision for v0.1: avoid `interface` and use only `trait`.
 This RFC leaves the following decisions open:
 
 1. Semicolons are required after executable statements and expression statements.
-2. `void` may be written as an explicit return type; omitted return type also means `void`.
+2. `void` is the explicit return type for functions that do not return a value.
 3. `interface` does not exist separately from `trait` in v0.1.
 4. `if` starts as a statement in the MVP; expression form is postponed.
 5. `match` starts as a statement in the MVP; expression form is postponed.
-6. Local initializer inference is allowed; function signatures remain explicit.
+6. Local initializer inference is postponed; function signatures and local declarations remain explicit.
 7. Generic type syntax uses `Name<T>` and `Name<T, E>` as the intended direction, with full semantics postponed.
 8. References use `&T` and `&mut T` as the intended direction; raw pointers need a later RFC.

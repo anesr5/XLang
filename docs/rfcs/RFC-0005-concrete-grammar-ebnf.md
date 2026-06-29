@@ -64,15 +64,15 @@ The current compiler accepts simple identifier module and import names only. Dot
 
 ```ebnf
 struct_decl = "struct", identifier, "{", { field_decl }, "}" ;
-field_decl  = identifier, ":", type_name, ";" ;
+field_decl  = type_name, identifier, ";" ;
 ```
 
 Example:
 
 ```xlang
 struct Player {
-    hp: i32;
-    alive: bool;
+    i32 hp;
+    bool alive;
 }
 ```
 
@@ -80,25 +80,26 @@ Struct field declarations are semicolon-terminated because newlines are not gram
 
 MVP implementation note: top-level struct declarations are parsed and retained in the AST. Function signatures may not use named struct types yet, and the LLVM backend does not lower structs.
 
+Semantic validation rejects duplicate struct names and duplicate field names within a single struct. Distinct structs may reuse the same field names.
+
 ---
 
 ## 5. Function Declarations
 
 ```ebnf
-function_decl = "fn", identifier, "(", [ param_list ], ")", [ return_type ], block ;
+function_decl = type_name, identifier, "(", [ param_list ], ")", block ;
 param_list    = param, { ",", param } ;
-param         = identifier, ":", type_name ;
-return_type   = "->", type_name ;
+param         = type_name, identifier ;
 ```
 
-Omitted return type means `void`.
+Use `void` as the return type for functions that do not return a value (e.g. `void tick()`).
 
-MVP entry-point rule: a program must define `fn main() -> i32` with no parameters.
+MVP entry-point rule: a program must define `i32 main()` with no parameters.
 
 Example:
 
 ```xlang
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 ```
@@ -130,7 +131,7 @@ bool
 void
 ```
 
-Semantic restriction: `void` is valid as an omitted or explicit function return type. It is not valid as a parameter type or as the type of a first-class value.
+Semantic restriction: `void` is valid as an explicit function return type (e.g. `void tick()`). It is not valid as a parameter type or as the type of a first-class value.
 
 ---
 
@@ -144,20 +145,20 @@ statement  = binding_stmt
            | if_stmt
            | expr_stmt ;
 
-binding_stmt    = ( "let" | "var" | "const" ), identifier, [ ":", type_name ], "=", expr, ";" ;
+binding_stmt    = [ "const" ], type_name, identifier, "=", expr, ";" ;
 assignment_stmt = identifier, "=", expr, ";" ;
 return_stmt     = "return", [ expr ], ";" ;
 expr_stmt       = expr, ";" ;
 ```
 
-`let` and `const` create immutable bindings. `var` creates a mutable binding.
+Typed local declarations create mutable bindings by default. A declaration prefixed with `const` creates an immutable binding. Initializers are required for all MVP local declarations.
 
 Within one function scope, parameter names must be unique and local bindings may not redeclare an existing parameter or local binding. Nested lexical scopes are postponed, so bindings declared inside `if` branches reserve their names in the enclosing function binding namespace. Branch-local bindings are not usable after the `if` until a later definite-assignment and lexical-scope model is introduced.
 
 Executable statements and expression statements are semicolon-terminated in v0.1:
 
 ```xlang
-let x = 40;
+i32 x = 40;
 return x + 2;
 ```
 
@@ -216,24 +217,24 @@ The frontend type checker currently supports integer, boolean, and string expres
 ```xlang
 module main
 
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 
-fn main() -> i32 {
-    let x = add(40, 2);
+i32 main() {
+    i32 x = add(40, 2);
     return x;
 }
 ```
 
 ```xlang
 struct Pair {
-    left: i32;
-    right: i32;
+    i32 left;
+    i32 right;
 }
 
-fn main() -> i32 {
-    var x = 1;
+i32 main() {
+    i32 x = 1;
     x = x + 41;
     return x;
 }
@@ -274,4 +275,4 @@ MVP parser implementation note: expression nodes carry source spans; binding and
 3. Should `else if` become syntax sugar, or remain a nested `if` inside an `else` block?
 4. Should `if` become an expression after the MVP statement form is stable?
 5. What is the concrete grammar for struct construction and field access?
-6. Should `const` remain a binding statement in the same grammar family as `let`, or become a compile-time item with stricter rules?
+6. Should future compile-time constants reuse `const` syntax, or introduce a separate item-level declaration form?

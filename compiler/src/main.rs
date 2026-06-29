@@ -91,3 +91,49 @@ impl Invocation {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn invocation_defaults_to_main_file() {
+        let invocation = Invocation::parse(&[]).unwrap();
+        assert_eq!(invocation.file, PathBuf::from("main.x"));
+    }
+
+    #[test]
+    fn invocation_accepts_target_before_or_after_file() {
+        let invocation =
+            Invocation::parse(&args(&["--target", "wasm32-unknown-unknown", "main.x"])).unwrap();
+        assert_eq!(invocation.file, PathBuf::from("main.x"));
+        assert_eq!(
+            invocation.options.target_triple.as_deref(),
+            Some("wasm32-unknown-unknown")
+        );
+
+        let invocation =
+            Invocation::parse(&args(&["main.x", "--target=x86_64-pc-windows-msvc"])).unwrap();
+        assert_eq!(invocation.file, PathBuf::from("main.x"));
+        assert_eq!(
+            invocation.options.target_triple.as_deref(),
+            Some("x86_64-pc-windows-msvc")
+        );
+    }
+
+    #[test]
+    fn invocation_rejects_bad_arguments() {
+        for values in [
+            vec!["--target"],
+            vec!["--target="],
+            vec!["--unknown"],
+            vec!["a.x", "b.x"],
+        ] {
+            assert!(Invocation::parse(&args(&values)).is_err());
+        }
+    }
+}

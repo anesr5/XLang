@@ -21,12 +21,12 @@ Example target program:
 ```xlang
 module main
 
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 
-fn main() -> i32 {
-    let x = add(10, 20);
+i32 main() {
+    i32 x = add(10, 20);
     return x;
 }
 ```
@@ -166,17 +166,10 @@ Support:
 Primitive types:
 
 ```text
+i32
 bool
-char
-str
-
-i8 i16 i32 i64 i128
-u8 u16 u32 u64 u128
-
-f16 f32 f64
-
-usize
-isize
+void
+str (frontend only; rejected by LLVM lowering)
 ```
 
 ---
@@ -188,7 +181,7 @@ For the first compiler, generate LLVM IR directly through Inkwell.
 Example XLang:
 
 ```xlang
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 ```
@@ -250,13 +243,13 @@ The compiler should include tests for:
 Example invalid test:
 
 ```xlang
-let x: i32 = 3.14;
+i32 x = 3.14;
 ```
 
 Expected diagnostic:
 
 ```text
-error[E0001]: cannot assign f64 to i32 without explicit cast
+error[E0100]: expected expression
 ```
 
 ---
@@ -315,9 +308,9 @@ Compile and run:
 ```xlang
 module main
 
-fn main() -> i32 {
-    let x = 40;
-    let y = 2;
+i32 main() {
+    i32 x = 40;
+    i32 y = 2;
     return x + y;
 }
 ```

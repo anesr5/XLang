@@ -147,7 +147,7 @@ XLang functions lower to LLVM functions with matching names.
 Example XLang:
 
 ```xlang
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 ```
@@ -179,12 +179,14 @@ The current MVP lowers function parameters and local bindings to stack slots wit
 This conservative model is intentionally easy to audit and gives assignments stable semantics across structured control flow:
 
 ```text
-let x = value;  -> alloca slot for x, then store value
+i32 x = value;  -> alloca slot for x, then store value
 x = value;      -> store value into x's existing slot
 use x           -> load from x's slot
 ```
 
 Parameter names must be unique. Local bindings may not redeclare an existing parameter or local binding in the same function scope.
+
+Source-level `const` locals use the same storage shape after checking. Their immutability is enforced by the frontend before lowering, so the backend never emits assignments that violate `const`.
 
 This is not the final optimized local-lowering model, but it is correct for mutable locals that cross `if` joins. Future optimization may produce `mem2reg`-friendly IR or explicit SSA phi construction after the MVP semantics are stable.
 
@@ -240,7 +242,7 @@ Function calls lower to direct LLVM calls.
 Example:
 
 ```xlang
-let x = add(40, 2);
+i32 x = add(40, 2);
 ```
 
 Expected LLVM shape:
@@ -318,7 +320,7 @@ When `--target` or `XLANG_TARGET_TRIPLE` is configured, `build` passes the same 
 
 LLVM IR snapshot tests should cover:
 
-- minimal `fn main() -> i32`
+- minimal `i32 main()`
 - function declarations and direct calls
 - local bindings and assignments
 - arithmetic expressions
@@ -350,3 +352,154 @@ Snapshot tests should assert that no C source file, generated C text, or `gcc` i
 3. What is the first supported struct layout and ABI rule set?
 4. Should `emit-llvm` support writing to an explicit output path in addition to stdout?
 5. Should the compiler eventually invoke LLVM object emission directly instead of linking textual IR through clang?
+
+---
+
+## v0.2 Additions (Draft — RFC-0014 through RFC-0017)
+
+This section extends the lowering contract for **XLang v0.2**. v0.1 rules above remain in force unless superseded here.
+
+Related RFCs:
+
+- [RFC-0014](RFC-0014-v0-2-roadmap-and-scope.md) — scope
+- [RFC-0015](RFC-0015-while-loops-break-and-continue.md) — loops
+- [RFC-0016](RFC-0016-fixed-size-arrays.md) — stack arrays
+- [RFC-0017](RFC-0017-index-expressions-and-bounds-checking.md) — indexing and bounds checks
+
+### v0.2 Supported Surface
+
+The v0.2 backend adds lowering for:
+
+- `while` loops
+- `break` and `continue` targeting the innermost active loop
+- fixed-size stack arrays of `i32` and `bool`
+- array literals with compile-time length `N`
+- index reads and writes with runtime bounds checks
+
+Still **unsupported** in v0.2 backend:
+
+- `str` and `str[N]`
+- struct and named-type arrays
+- dynamic arrays, pointers, heap allocation
+- array function parameters and returns
+- `for` loops
+
+### v0.2 Type Lowering
+
+```text
+XLang i32[N]  -> LLVM [N x i32]   (in alloca slot)
+XLang bool[N] -> LLVM [N x i1]    (in alloca slot)
+```
+
+Array locals lower to a stack slot of array type:
+
+```llvm
+%xs = alloca [4 x i32], align 4
+```
+
+Element types follow scalar mapping from §5.
+
+### v0.2 Array Initialization
+
+Array literals lower by storing each element:
+
+```xlang
+i32[2] xs = { 1, 2 };
+```
+
+Expected shape (conceptual):
+
+```llvm
+%xs = alloca [2 x i32], align 4
+%gep0 = getelementptr [2 x i32], ptr %xs, i32 0, i32 0
+store i32 1, ptr %gep0
+%gep1 = getelementptr [2 x i32], ptr %xs, i32 0, i32 1
+store i32 2, ptr %gep1
+```
+
+When all elements are compile-time constants, the backend may use a single constant aggregate `store` instead.
+
+### v0.2 Index Lowering
+
+For `xs[i]` with runtime index:
+
+```llvm
+; assume %i loaded as i32, %xs is ptr to [N x i32]
+%ge = icmp sge i32 %i, 0
+%lt = icmp slt i32 %i, N
+%ok = and i1 %ge, %lt
+br i1 %ok, label %idx.ok, label %idx.trap
+
+idx.ok:
+  %ep = getelementptr [N x i32], ptr %xs, i32 0, i32 %i
+  %val = load i32, ptr %ep
+  br label %idx.end
+
+idx.trap:
+  call void @llvm.trap()
+  unreachable
+
+idx.end:
+  ...
+```
+
+Assignment stores follow the same guard before `store`.
+
+Constant out-of-bounds indices should be rejected in the frontend; the backend must not emit guarded access for indices proven invalid at compile time.
+
+### v0.2 While Lowering
+
+```xlang
+while cond {
+    body;
+}
+```
+
+Block layout:
+
+```text
+while.cond:
+  evaluate cond -> i1
+  br i1 %c, label %while.body, label %while.end
+
+while.body:
+  emit body
+  br label %while.cond
+
+while.end:
+  continue with following statements
+```
+
+Nested loops push/pop `(cond, end)` label pairs on a loop stack.
+
+- `break` → `br label %while.end` for innermost loop
+- `continue` → `br label %while.cond` for innermost loop
+
+If the body ends with `break`, do not fall through to the back-edge.
+
+Terminated blocks (`return`, `break`, `continue`) must not emit spurious fall-through branches.
+
+### v0.2 Local Storage Model
+
+Scalars continue to use `alloca` + `load`/`store` per §7.
+
+Arrays use one `alloca [N x T]` per binding. There is no whole-array `load`; uses go through element GEPs.
+
+`const` array immutability is enforced in the frontend; the backend does not emit stores through `const` bindings.
+
+### v0.2 Module Verification
+
+All v0.2 constructs must still pass `Module::verify()`. Trap blocks may end with `unreachable` after `@llvm.trap()`.
+
+### v0.2 Snapshot Tests
+
+Add snapshots for:
+
+- empty `while` never entered
+- `while` with assignment and back-edge
+- nested `while` with `break` / `continue`
+- array literal initialization
+- index load and index assign with bounds check branches
+- compile-time rejection paths (negative tests — see RFC-0013 § v0.2)
+
+Pin target triple and normalize trap block names in snapshots where needed.

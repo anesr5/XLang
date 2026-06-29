@@ -70,7 +70,7 @@ Line comments start with `//` and continue until the end of the line.
 
 ```xlang
 // This is a line comment
-let x = 10;
+i32 x = 10;
 ```
 
 Block comments start with `/*` and end with `*/`.
@@ -79,7 +79,7 @@ Block comments start with `/*` and end with `*/`.
 /*
 This is a block comment.
 */
-let x = 10;
+i32 x = 10;
 ```
 
 Nested block comments are an open question.
@@ -90,7 +90,7 @@ Documentation comments are supported lexically.
 
 ```xlang
 /// Adds two integers.
-fn add(a: i32, b: i32) -> i32 {
+i32 add(i32 a, i32 b) {
     return a + b;
 }
 ```
@@ -137,14 +137,10 @@ The following words are reserved and cannot be used as identifiers:
 module
 import
 
-fn
-
 struct
 enum
 trait
 
-let
-var
 const
 
 if
@@ -189,6 +185,8 @@ mut
 as
 in
 ```
+
+`fn`, `let`, and `var` are **not** keywords in v0.1 — they are valid identifier spellings. The concrete grammar uses C-style declarations only.
 
 Not all keywords are implemented in the MVP compiler.
 
@@ -457,7 +455,7 @@ Span {
 
 The high-assurance compiler target requires file IDs, byte ranges, start/end line and column positions, and stable diagnostic rendering.
 
-The MVP lexer implementation stores full token spans with a bootstrap file ID of `0` until multi-file source management is introduced. The parser preserves spans on expression nodes, binding/assignment identifiers, binding annotations, return/if statements, function names, parameter names, parameter types, return types, and struct fields so semantic and backend diagnostics can point at source-level anchors instead of falling back to `1:1`.
+The MVP lexer implementation stores full token spans with a bootstrap file ID of `0` until multi-file source management is introduced. The parser preserves spans on expression nodes, local declaration and assignment identifiers, local declaration type names, return/if statements, function names, parameter names, parameter types, return types, and struct fields so semantic and backend diagnostics can point at source-level anchors instead of falling back to `1:1`.
 
 ---
 

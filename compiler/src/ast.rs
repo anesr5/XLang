@@ -48,6 +48,16 @@ pub enum TypeName {
     Str,
     Void,
     Named(String),
+    Array { elem: Box<TypeName>, len: usize },
+}
+
+impl TypeName {
+    pub fn array_elem_len(&self) -> Option<(&TypeName, usize)> {
+        match self {
+            TypeName::Array { elem, len } => Some((elem.as_ref(), *len)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +85,23 @@ pub enum Stmt {
         keyword_span: Span,
         then_body: Vec<Stmt>,
         else_body: Vec<Stmt>,
+    },
+    While {
+        condition: Expr,
+        keyword_span: Span,
+        body: Vec<Stmt>,
+    },
+    Break {
+        keyword_span: Span,
+    },
+    Continue {
+        keyword_span: Span,
+    },
+    AssignIndex {
+        name: String,
+        name_span: Span,
+        index: Expr,
+        value: Expr,
     },
 }
 
@@ -112,6 +139,15 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    ArrayLiteral {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -123,7 +159,9 @@ impl Expr {
             | Expr::Variable { span, .. }
             | Expr::Call { span, .. }
             | Expr::Unary { span, .. }
-            | Expr::Binary { span, .. } => *span,
+            | Expr::Binary { span, .. }
+            | Expr::ArrayLiteral { span, .. }
+            | Expr::Index { span, .. } => *span,
         }
     }
 }

@@ -28,7 +28,7 @@ impl CompileOptions {
 
 pub fn check(file: &Path) -> XResult<CheckedProgram> {
     let source = fs::read_to_string(file)
-        .map_err(|err| Diagnostic::new(format!("failed to read source: {err}"), 1, 1))?;
+        .map_err(|err| Diagnostic::io(format!("failed to read source: {err}"), 1, 1))?;
     check_source(&source)
 }
 
@@ -65,10 +65,10 @@ pub fn build_with_options(file: &Path, options: &CompileOptions) -> XResult<Path
     let llvm_ir = emit_llvm_with_options(file, options)?;
     let build_dir = PathBuf::from("build");
     fs::create_dir_all(&build_dir)
-        .map_err(|err| Diagnostic::new(format!("failed to create build directory: {err}"), 1, 1))?;
+        .map_err(|err| Diagnostic::io(format!("failed to create build directory: {err}"), 1, 1))?;
     let ir_path = build_dir.join("main.ll");
     fs::write(&ir_path, llvm_ir)
-        .map_err(|err| Diagnostic::new(format!("failed to write LLVM IR: {err}"), 1, 1))?;
+        .map_err(|err| Diagnostic::io(format!("failed to write LLVM IR: {err}"), 1, 1))?;
 
     let executable = build_dir.join(if cfg!(windows) { "main.exe" } else { "main" });
     if command_exists("clang") {
@@ -82,14 +82,18 @@ pub fn build_with_options(file: &Path, options: &CompileOptions) -> XResult<Path
             .arg("-o")
             .arg(&executable)
             .status()
-            .map_err(|err| Diagnostic::new(format!("failed to invoke clang: {err}"), 1, 1))?;
+            .map_err(|err| Diagnostic::io(format!("failed to invoke clang: {err}"), 1, 1))?;
         if status.success() {
             return Ok(executable);
         }
-        return Err(Diagnostic::new("LLVM native build failed via clang", 1, 1));
+        return Err(Diagnostic::backend(
+            "LLVM native build failed via clang",
+            1,
+            1,
+        ));
     }
 
-    Err(Diagnostic::new(
+    Err(Diagnostic::backend(
         format!(
             "wrote LLVM IR to {}; install clang or another LLVM toolchain on PATH to produce a native executable",
             ir_path.display()
@@ -107,7 +111,7 @@ pub fn run_with_options(file: &Path, options: &CompileOptions) -> XResult<i32> {
     let executable = build_with_options(file, options)?;
     let status = Command::new(&executable)
         .status()
-        .map_err(|err| Diagnostic::new(format!("failed to run executable: {err}"), 1, 1))?;
+        .map_err(|err| Diagnostic::io(format!("failed to run executable: {err}"), 1, 1))?;
     Ok(status.code().unwrap_or(1))
 }
 

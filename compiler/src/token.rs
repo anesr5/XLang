@@ -50,12 +50,9 @@ pub enum TokenKind {
 pub enum Keyword {
     Module,
     Import,
-    Fn,
     Struct,
     Enum,
     Trait,
-    Let,
-    Var,
     Const,
     Return,
     If,

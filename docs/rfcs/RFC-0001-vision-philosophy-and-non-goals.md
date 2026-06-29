@@ -94,7 +94,7 @@ Example:
 
 ```xlang
 unsafe {
-    let ptr = raw_ptr(buffer);
+    RawPtr ptr = raw_ptr(buffer);
 }
 ```
 
@@ -141,11 +141,11 @@ The exact ownership model will be defined in a dedicated RFC.
 Initial direction:
 
 ```xlang
-let a = String.from("hello");
-let b = move a;
+String a = String.from("hello");
+String b = move a;
 
-let r = &b;
-let m = &mut b;
+Ref<String> r = &b;
+MutRef<String> m = &mut b;
 ```
 
 ---
@@ -159,7 +159,7 @@ XLang should not use hidden exceptions for normal error handling.
 Example direction:
 
 ```xlang
-fn read_file(path: str) -> Result<String, IoError> {
+Result<String, IoError> read_file(str path) {
     ...
 }
 ```
@@ -189,7 +189,7 @@ GPU support is a long-term core feature of XLang, but it should be introduced pr
 The language should eventually support GPU functions such as:
 
 ```xlang
-gpu fn blur(input: GpuBuffer<f32>, output: GpuBuffer<f32>) {
+gpu void blur(GpuBuffer<f32> input, GpuBuffer<f32> output) {
     ...
 }
 ```

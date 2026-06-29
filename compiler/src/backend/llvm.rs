@@ -42,14 +42,22 @@ struct FunctionEmitter<'emit, 'ctx> {
     builder: &'emit Builder<'ctx>,
     function: FunctionValue<'ctx>,
     functions: &'emit HashMap<&'emit str, FunctionValue<'ctx>>,
+    module: &'emit Module<'ctx>,
     locals: HashMap<String, Local<'ctx>>,
+    loop_stack: Vec<LoopLabels<'ctx>>,
     terminated: bool,
+}
+
+struct LoopLabels<'ctx> {
+    cond: BasicBlock<'ctx>,
+    end: BasicBlock<'ctx>,
 }
 
 #[derive(Clone)]
 struct Local<'ctx> {
     pointer: PointerValue<'ctx>,
-    ty: BasicTypeEnum<'ctx>,
+    ty: TypeName,
+    scalar_ty: Option<BasicTypeEnum<'ctx>>,
 }
 
 impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
@@ -79,9 +87,9 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
         for function in &self.program.functions {
             self.emit_function(function)?;
         }
-        self.module
-            .verify()
-            .map_err(|message| Diagnostic::new(format!("LLVM verifier failed: {message}"), 1, 1))?;
+        self.module.verify().map_err(|message| {
+            Diagnostic::backend(format!("LLVM verifier failed: {message}"), 1, 1)
+        })?;
         Ok(self.module.print_to_string().to_string())
     }
 
@@ -127,7 +135,7 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
             .get(function.name.as_str())
             .copied()
             .ok_or_else(|| {
-                Diagnostic::new(format!("unknown function `{}`", function.name), 1, 1)
+                Diagnostic::backend(format!("unknown function `{}`", function.name), 1, 1)
             })?;
         let entry = self.context.append_basic_block(function_value, "entry");
         self.builder.position_at_end(entry);
@@ -137,14 +145,16 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
             builder: &self.builder,
             function: function_value,
             functions: &self.functions,
+            module: &self.module,
             locals: HashMap::new(),
+            loop_stack: Vec::new(),
             terminated: false,
         };
 
         for (index, param) in function.params.iter().enumerate() {
             let value = function_value
                 .get_nth_param(index as u32)
-                .ok_or_else(|| Diagnostic::new("missing LLVM function parameter", 1, 1))?;
+                .ok_or_else(|| Diagnostic::backend("missing LLVM function parameter", 1, 1))?;
             value.set_name(&param.name);
             let ty = value.get_type();
             let slot = build_value(
@@ -152,9 +162,14 @@ impl<'ctx, 'program> LlvmEmitter<'ctx, 'program> {
                     .build_alloca(ty, &format!("{}.addr", param.name)),
             )?;
             build_unit(self.builder.build_store(slot, value))?;
-            emitter
-                .locals
-                .insert(param.name.clone(), Local { pointer: slot, ty });
+            emitter.locals.insert(
+                param.name.clone(),
+                Local {
+                    pointer: slot,
+                    ty: param.ty.clone(),
+                    scalar_ty: Some(ty),
+                },
+            );
         }
 
         for stmt in &function.body {
@@ -197,36 +212,93 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
             return Ok(());
         }
         match stmt {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let {
+                name,
+                value,
+                annotation,
+                ..
+            } => {
                 let source_span = value.span();
-                let value = self.emit_expr(value)?;
-                let Some(value) = value else {
-                    return Err(Diagnostic::at("cannot bind void value", source_span));
-                };
-                let ty = value.get_type();
-                let slot = build_value(self.builder.build_alloca(ty, name.as_str()))?;
-                build_unit(self.builder.build_store(slot, value))?;
-                self.locals
-                    .insert(name.clone(), Local { pointer: slot, ty });
+                if let Some(TypeName::Array { elem, len }) = annotation {
+                    self.emit_array_binding(name, elem, *len, value, source_span)?;
+                } else {
+                    let value = self.emit_expr(value)?;
+                    let Some(value) = value else {
+                        return Err(Diagnostic::backend_at(
+                            "cannot bind void value",
+                            source_span,
+                        ));
+                    };
+                    let ty = value.get_type();
+                    let slot = build_value(self.builder.build_alloca(ty, name.as_str()))?;
+                    build_unit(self.builder.build_store(slot, value))?;
+                    self.locals.insert(
+                        name.clone(),
+                        Local {
+                            pointer: slot,
+                            ty: annotation.clone().unwrap_or(TypeName::I32),
+                            scalar_ty: Some(ty),
+                        },
+                    );
+                }
             }
             Stmt::Assign { name, value, .. } => {
                 let source_span = value.span();
                 let value = self.emit_expr(value)?;
                 let Some(value) = value else {
-                    return Err(Diagnostic::at("cannot assign void value", source_span));
+                    return Err(Diagnostic::backend_at(
+                        "cannot assign void value",
+                        source_span,
+                    ));
                 };
-                let local = self
-                    .locals
-                    .get(name)
-                    .ok_or_else(|| Diagnostic::new(format!("unknown variable `{name}`"), 1, 1))?;
+                let local = self.locals.get(name).ok_or_else(|| {
+                    Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
+                })?;
+                if local.ty.array_elem_len().is_some() {
+                    return Err(Diagnostic::backend_at(
+                        "cannot assign to array binding as a whole",
+                        source_span,
+                    ));
+                }
                 build_unit(self.builder.build_store(local.pointer, value))?;
+            }
+            Stmt::AssignIndex {
+                name, index, value, ..
+            } => {
+                let (array_ptr, elem_ty, len) = {
+                    let local = self.locals.get(name).ok_or_else(|| {
+                        Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
+                    })?;
+                    let Some((elem_ty, len)) = local.ty.array_elem_len() else {
+                        return Err(Diagnostic::backend_at(
+                            "index assignment requires array binding",
+                            index.span(),
+                        ));
+                    };
+                    (local.pointer, elem_ty.clone(), len)
+                };
+                let index_value = expect_int_value(self.emit_expr(index)?)?;
+                self.emit_bounds_check(index_value, len, index.span())?;
+                let stored = self.emit_expr(value)?;
+                let Some(stored) = stored else {
+                    return Err(Diagnostic::backend_at(
+                        "cannot assign void value",
+                        value.span(),
+                    ));
+                };
+                let elem_ptr =
+                    self.emit_array_element_ptr(array_ptr, &elem_ty, len, index_value)?;
+                build_unit(self.builder.build_store(elem_ptr, stored))?;
             }
             Stmt::Return {
                 value: Some(expr), ..
             } => {
                 let value = self.emit_expr(expr)?;
                 let Some(value) = value else {
-                    return Err(Diagnostic::at("cannot return void value", expr.span()));
+                    return Err(Diagnostic::backend_at(
+                        "cannot return void value",
+                        expr.span(),
+                    ));
                 };
                 build_unit(self.builder.build_return(Some(&value)))?;
                 self.terminated = true;
@@ -244,15 +316,185 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                 then_body,
                 else_body,
             } => self.emit_if(condition, then_body, else_body)?,
+            Stmt::While {
+                condition,
+                keyword_span: _,
+                body,
+            } => self.emit_while(condition, body)?,
+            Stmt::Break { keyword_span } => {
+                let Some(labels) = self.loop_stack.last() else {
+                    return Err(Diagnostic::backend_at(
+                        "break outside of loop",
+                        *keyword_span,
+                    ));
+                };
+                build_unit(self.builder.build_unconditional_branch(labels.end))?;
+                self.terminated = true;
+            }
+            Stmt::Continue { keyword_span } => {
+                let Some(labels) = self.loop_stack.last() else {
+                    return Err(Diagnostic::backend_at(
+                        "continue outside of loop",
+                        *keyword_span,
+                    ));
+                };
+                build_unit(self.builder.build_unconditional_branch(labels.cond))?;
+                self.terminated = true;
+            }
         }
         Ok(())
+    }
+
+    fn emit_while(&mut self, condition: &Expr, body: &[Stmt]) -> XResult<()> {
+        let cond_block = self.context.append_basic_block(self.function, "while.cond");
+        let body_block = self.context.append_basic_block(self.function, "while.body");
+        let end_block = self.context.append_basic_block(self.function, "while.end");
+
+        build_unit(self.builder.build_unconditional_branch(cond_block))?;
+        self.loop_stack.push(LoopLabels {
+            cond: cond_block,
+            end: end_block,
+        });
+
+        self.builder.position_at_end(cond_block);
+        let condition_value = self.emit_expr(condition)?;
+        let condition_value = condition_value
+            .ok_or_else(|| {
+                Diagnostic::backend_at("while condition cannot be void", condition.span())
+            })?
+            .into_int_value();
+        build_unit(
+            self.builder
+                .build_conditional_branch(condition_value, body_block, end_block),
+        )?;
+
+        self.builder.position_at_end(body_block);
+        self.terminated = false;
+        for stmt in body {
+            self.emit_stmt(stmt)?;
+        }
+        if !self.terminated {
+            build_unit(self.builder.build_unconditional_branch(cond_block))?;
+        }
+
+        self.loop_stack.pop();
+        self.builder.position_at_end(end_block);
+        self.terminated = false;
+        Ok(())
+    }
+
+    fn emit_array_binding(
+        &mut self,
+        name: &str,
+        elem: &TypeName,
+        len: usize,
+        value: &Expr,
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<()> {
+        let array_ty = llvm_array_type(self.context, elem, len)?;
+        let slot = build_value(self.builder.build_alloca(array_ty, name))?;
+        let Expr::ArrayLiteral { elements, .. } = value else {
+            return Err(Diagnostic::backend_at(
+                "array binding requires array literal initializer",
+                source_span,
+            ));
+        };
+        for (index, element) in elements.iter().enumerate() {
+            let rendered = self.emit_expr(element)?;
+            let Some(rendered) = rendered else {
+                return Err(Diagnostic::backend_at(
+                    "cannot initialize array with void value",
+                    element.span(),
+                ));
+            };
+            let index_value = self.context.i32_type().const_int(index as u64, false);
+            let elem_ptr = self.emit_array_element_ptr(slot, elem, len, index_value)?;
+            build_unit(self.builder.build_store(elem_ptr, rendered))?;
+        }
+        self.locals.insert(
+            name.to_owned(),
+            Local {
+                pointer: slot,
+                ty: TypeName::Array {
+                    elem: Box::new(elem.clone()),
+                    len,
+                },
+                scalar_ty: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn emit_bounds_check(
+        &mut self,
+        index: inkwell::values::IntValue<'ctx>,
+        len: usize,
+        _span: crate::diagnostic::Span,
+    ) -> XResult<()> {
+        let i32 = self.context.i32_type();
+        let zero = i32.const_int(0, true);
+        let ge = build_value(self.builder.build_int_compare(
+            IntPredicate::SGE,
+            index,
+            zero,
+            "bounds.ge",
+        ))?;
+        let len_const = i32.const_int(len as u64, false);
+        let lt = build_value(self.builder.build_int_compare(
+            IntPredicate::SLT,
+            index,
+            len_const,
+            "bounds.lt",
+        ))?;
+        let ok = build_value(self.builder.build_and(ge, lt, "bounds.ok"))?;
+
+        let ok_block = self.context.append_basic_block(self.function, "bounds.ok");
+        let trap_block = self
+            .context
+            .append_basic_block(self.function, "bounds.trap");
+        let resume_block = self
+            .context
+            .append_basic_block(self.function, "bounds.resume");
+
+        build_unit(
+            self.builder
+                .build_conditional_branch(ok, ok_block, trap_block),
+        )?;
+
+        self.builder.position_at_end(trap_block);
+        let trap = self.module.get_function("llvm.trap").unwrap_or_else(|| {
+            let fn_type = self.context.void_type().fn_type(&[], false);
+            self.module.add_function("llvm.trap", fn_type, None)
+        });
+        build_unit(self.builder.build_call(trap, &[], "trap"))?;
+        build_unit(self.builder.build_unreachable())?;
+
+        self.builder.position_at_end(ok_block);
+        build_unit(self.builder.build_unconditional_branch(resume_block))?;
+        self.builder.position_at_end(resume_block);
+        Ok(())
+    }
+
+    fn emit_array_element_ptr(
+        &mut self,
+        array_ptr: PointerValue<'ctx>,
+        elem: &TypeName,
+        len: usize,
+        index: inkwell::values::IntValue<'ctx>,
+    ) -> XResult<PointerValue<'ctx>> {
+        let array_ty = llvm_array_type(self.context, elem, len)?;
+        let zero = self.context.i32_type().const_int(0, false);
+        build_value(unsafe {
+            self.builder
+                .build_gep(array_ty, array_ptr, &[zero, index], "array.elem")
+        })
     }
 
     fn emit_if(&mut self, condition: &Expr, then_body: &[Stmt], else_body: &[Stmt]) -> XResult<()> {
         let condition_span = condition.span();
         let condition = self.emit_expr(condition)?;
         let condition = condition
-            .ok_or_else(|| Diagnostic::at("if condition cannot be void", condition_span))?
+            .ok_or_else(|| Diagnostic::backend_at("if condition cannot be void", condition_span))?
             .into_int_value();
 
         let then_block = self.context.append_basic_block(self.function, "if.then");
@@ -284,12 +526,35 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
         }
 
         if then_terminated && else_terminated {
+            self.builder.position_at_end(end_block);
+            build_unit(self.builder.build_unreachable())?;
             self.terminated = true;
         } else {
             self.builder.position_at_end(end_block);
             self.terminated = false;
         }
         Ok(())
+    }
+
+    fn resolve_array_base(&self, expr: &Expr) -> XResult<(PointerValue<'ctx>, TypeName, usize)> {
+        match expr {
+            Expr::Variable { name, span } => {
+                let local = self.locals.get(name).ok_or_else(|| {
+                    Diagnostic::backend_at(format!("unknown variable `{name}`"), *span)
+                })?;
+                let Some((elem, len)) = local.ty.array_elem_len() else {
+                    return Err(Diagnostic::backend_at(
+                        "index base must be an array binding",
+                        *span,
+                    ));
+                };
+                Ok((local.pointer, elem.clone(), len))
+            }
+            _ => Err(Diagnostic::backend_at(
+                "index base must be a variable",
+                expr.span(),
+            )),
+        }
     }
 
     fn emit_expr(&mut self, expr: &Expr) -> XResult<Option<BasicValueEnum<'ctx>>> {
@@ -307,13 +572,18 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                     .as_basic_value_enum(),
             )),
             Expr::String { span, .. } => Err(unsupported_backend_type(*span)),
-            Expr::Variable { name, .. } => {
-                let local = self
-                    .locals
-                    .get(name)
-                    .ok_or_else(|| Diagnostic::new(format!("unknown variable `{name}`"), 1, 1))?;
+            Expr::Variable { name, span } => {
+                let local = self.locals.get(name).ok_or_else(|| {
+                    Diagnostic::backend(format!("unknown variable `{name}`"), 1, 1)
+                })?;
+                let Some(scalar_ty) = local.scalar_ty else {
+                    return Err(Diagnostic::backend_at(
+                        "cannot use array binding as scalar value",
+                        *span,
+                    ));
+                };
                 Ok(Some(build_value(self.builder.build_load(
-                    local.ty,
+                    scalar_ty,
                     local.pointer,
                     &format!("{name}.load"),
                 ))?))
@@ -351,6 +621,27 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
                 BinaryOp::Or => self.emit_short_circuit_or(left, right),
                 _ => self.emit_binary(left, *op, right),
             },
+            Expr::ArrayLiteral { span, .. } => Err(Diagnostic::backend_at(
+                "array literals are only supported in array bindings",
+                *span,
+            )),
+            Expr::Index {
+                base,
+                index,
+                span: _,
+            } => {
+                let (array_ptr, elem_ty, len) = self.resolve_array_base(base)?;
+                let index_value = expect_int_value(self.emit_expr(index)?)?;
+                self.emit_bounds_check(index_value, len, index.span())?;
+                let elem_ptr =
+                    self.emit_array_element_ptr(array_ptr, &elem_ty, len, index_value)?;
+                let scalar_ty = llvm_basic_type(self.context, &elem_ty)?;
+                Ok(Some(build_value(self.builder.build_load(
+                    scalar_ty,
+                    elem_ptr,
+                    "index.load",
+                ))?))
+            }
         }
     }
 
@@ -359,12 +650,12 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
             .functions
             .get(callee)
             .copied()
-            .ok_or_else(|| Diagnostic::new(format!("unknown function `{callee}`"), 1, 1))?;
+            .ok_or_else(|| Diagnostic::backend(format!("unknown function `{callee}`"), 1, 1))?;
         let mut rendered = Vec::new();
         for arg in args {
             let value = self.emit_expr(arg)?;
             let Some(value) = value else {
-                return Err(Diagnostic::new("cannot pass void as an argument", 1, 1));
+                return Err(Diagnostic::backend("cannot pass void as an argument", 1, 1));
             };
             rendered.push(BasicMetadataValueEnum::from(value));
         }
@@ -456,7 +747,7 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
         let left_block = self
             .builder
             .get_insert_block()
-            .ok_or_else(|| Diagnostic::new("LLVM builder is not positioned", 1, 1))?;
+            .ok_or_else(|| Diagnostic::backend("LLVM builder is not positioned", 1, 1))?;
         let rhs_block = self.context.append_basic_block(self.function, "and.rhs");
         let end_block = self.context.append_basic_block(self.function, "and.end");
         build_unit(
@@ -485,7 +776,7 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
         let left_block = self
             .builder
             .get_insert_block()
-            .ok_or_else(|| Diagnostic::new("LLVM builder is not positioned", 1, 1))?;
+            .ok_or_else(|| Diagnostic::backend("LLVM builder is not positioned", 1, 1))?;
         let rhs_block = self.context.append_basic_block(self.function, "or.rhs");
         let end_block = self.context.append_basic_block(self.function, "or.end");
         build_unit(
@@ -508,13 +799,34 @@ impl<'emit, 'ctx> FunctionEmitter<'emit, 'ctx> {
 
 fn ensure_stmt_supported(stmt: &Stmt) -> XResult<()> {
     match stmt {
-        Stmt::Let { value, .. }
-        | Stmt::Assign { value, .. }
+        Stmt::Let {
+            value, annotation, ..
+        } => {
+            if let Some(ty) = annotation {
+                ensure_local_type_supported(ty, value.span())?;
+            }
+            ensure_expr_supported(value)
+        }
+        Stmt::Assign { value, .. }
         | Stmt::Return {
             value: Some(value), ..
         }
         | Stmt::Expr(value) => ensure_expr_supported(value),
         Stmt::Return { value: None, .. } => Ok(()),
+        Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+        Stmt::While {
+            condition, body, ..
+        } => {
+            ensure_expr_supported(condition)?;
+            for stmt in body {
+                ensure_stmt_supported(stmt)?;
+            }
+            Ok(())
+        }
+        Stmt::AssignIndex { index, value, .. } => {
+            ensure_expr_supported(index)?;
+            ensure_expr_supported(value)
+        }
         Stmt::If {
             condition,
             keyword_span: _,
@@ -545,13 +857,59 @@ fn ensure_expr_supported(expr: &Expr) -> XResult<()> {
             ensure_expr_supported(right)
         }
         Expr::Integer { .. } | Expr::Bool { .. } | Expr::Variable { .. } => Ok(()),
+        Expr::ArrayLiteral { elements, .. } => {
+            for element in elements {
+                ensure_expr_supported(element)?;
+            }
+            Ok(())
+        }
+        Expr::Index { base, index, .. } => {
+            ensure_expr_supported(base)?;
+            ensure_expr_supported(index)
+        }
+    }
+}
+
+fn ensure_array_element_backend_type(
+    elem: &TypeName,
+    span: crate::diagnostic::Span,
+) -> XResult<()> {
+    match elem {
+        TypeName::I32 | TypeName::Bool => Ok(()),
+        TypeName::Str | TypeName::Named(_) | TypeName::Void | TypeName::Array { .. } => {
+            Err(unsupported_backend_type(span))
+        }
+    }
+}
+
+fn ensure_local_type_supported(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
+    match ty {
+        TypeName::I32 | TypeName::Bool | TypeName::Void => Ok(()),
+        TypeName::Array { elem, .. } => ensure_array_element_backend_type(elem, span),
+        TypeName::Str | TypeName::Named(_) => Err(unsupported_backend_type(span)),
     }
 }
 
 fn ensure_backend_type(ty: &TypeName, span: crate::diagnostic::Span) -> XResult<()> {
     match ty {
         TypeName::I32 | TypeName::Bool | TypeName::Void => Ok(()),
-        TypeName::Str | TypeName::Named(_) => Err(unsupported_backend_type(span)),
+        TypeName::Array { .. } | TypeName::Str | TypeName::Named(_) => {
+            Err(unsupported_backend_type(span))
+        }
+    }
+}
+
+fn llvm_array_type<'ctx>(
+    context: &'ctx Context,
+    elem: &TypeName,
+    len: usize,
+) -> XResult<inkwell::types::ArrayType<'ctx>> {
+    match elem {
+        TypeName::I32 => Ok(context.i32_type().array_type(len as u32)),
+        TypeName::Bool => Ok(context.bool_type().array_type(len as u32)),
+        _ => Err(unsupported_backend_type(crate::diagnostic::Span::point(
+            1, 1,
+        ))),
     }
 }
 
@@ -559,9 +917,9 @@ fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: &TypeName) -> XResult<Basic
     match ty {
         TypeName::I32 => Ok(context.i32_type().as_basic_type_enum()),
         TypeName::Bool => Ok(context.bool_type().as_basic_type_enum()),
-        TypeName::Void | TypeName::Str | TypeName::Named(_) => Err(unsupported_backend_type(
-            crate::diagnostic::Span::point(1, 1),
-        )),
+        TypeName::Void | TypeName::Str | TypeName::Named(_) | TypeName::Array { .. } => Err(
+            unsupported_backend_type(crate::diagnostic::Span::point(1, 1)),
+        ),
     }
 }
 
@@ -574,7 +932,7 @@ fn function_return_type(function: FunctionValue<'_>) -> XResult<TypeName> {
         return match width {
             1 => Ok(TypeName::Bool),
             32 => Ok(TypeName::I32),
-            _ => Err(Diagnostic::new(
+            _ => Err(Diagnostic::backend(
                 format!("unsupported LLVM integer return width `{width}`"),
                 1,
                 1,
@@ -588,7 +946,11 @@ fn function_return_type(function: FunctionValue<'_>) -> XResult<TypeName> {
 
 fn expect_int_value(value: Option<BasicValueEnum<'_>>) -> XResult<inkwell::values::IntValue<'_>> {
     let Some(value) = value else {
-        return Err(Diagnostic::new("expected integer value, got void", 1, 1));
+        return Err(Diagnostic::backend(
+            "expected integer value, got void",
+            1,
+            1,
+        ));
     };
     if !value.is_int_value() {
         return Err(unsupported_backend_type(crate::diagnostic::Span::point(
@@ -599,7 +961,7 @@ fn expect_int_value(value: Option<BasicValueEnum<'_>>) -> XResult<inkwell::value
 }
 
 fn build_value<T>(result: Result<T, inkwell::builder::BuilderError>) -> XResult<T> {
-    result.map_err(|err| Diagnostic::new(format!("LLVM builder error: {err:?}"), 1, 1))
+    result.map_err(|err| Diagnostic::backend(format!("LLVM builder error: {err:?}"), 1, 1))
 }
 
 fn build_unit<T>(result: Result<T, inkwell::builder::BuilderError>) -> XResult<()> {
@@ -609,11 +971,11 @@ fn build_unit<T>(result: Result<T, inkwell::builder::BuilderError>) -> XResult<(
 fn current_block<'ctx>(builder: &Builder<'ctx>) -> XResult<BasicBlock<'ctx>> {
     builder
         .get_insert_block()
-        .ok_or_else(|| Diagnostic::new("LLVM builder is not positioned", 1, 1))
+        .ok_or_else(|| Diagnostic::backend("LLVM builder is not positioned", 1, 1))
 }
 
 fn unsupported_backend_type(span: crate::diagnostic::Span) -> Diagnostic {
-    Diagnostic::at(
+    Diagnostic::backend_at(
         "LLVM MVP supports i32, bool, and void code generation only",
         span,
     )

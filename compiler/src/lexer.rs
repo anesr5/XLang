@@ -33,6 +33,7 @@ impl Lexer {
                     self.advance();
                 }
                 '/' if self.peek_next() == Some('/') => self.skip_line_comment(),
+                '/' if self.peek_next() == Some('*') => self.skip_block_comment()?,
                 '0'..='9' => tokens.push(self.lex_number()?),
                 '"' => tokens.push(self.lex_string()?),
                 '\'' => tokens.push(self.lex_char()?),
@@ -91,7 +92,7 @@ impl Lexer {
                 '[' => tokens.push(self.single(TokenKind::LeftBracket)),
                 ']' => tokens.push(self.single(TokenKind::RightBracket)),
                 other => {
-                    return Err(Diagnostic::new(
+                    return Err(Diagnostic::lexical(
                         format!("unknown character `{other}`"),
                         self.line,
                         self.column,
@@ -122,6 +123,26 @@ impl Lexer {
         }
     }
 
+    fn skip_block_comment(&mut self) -> XResult<()> {
+        let line = self.line;
+        let column = self.column;
+        self.advance();
+        self.advance();
+        while let Some(ch) = self.peek() {
+            if ch == '*' && self.peek_next() == Some('/') {
+                self.advance();
+                self.advance();
+                return Ok(());
+            }
+            self.advance();
+        }
+        Err(Diagnostic::lexical(
+            "unterminated block comment",
+            line,
+            column,
+        ))
+    }
+
     fn lex_number(&mut self) -> XResult<Token> {
         let line = self.line;
         let column = self.column;
@@ -145,7 +166,7 @@ impl Lexer {
         }
         let value = text
             .parse::<i64>()
-            .map_err(|_| Diagnostic::new("integer literal is too large", line, column))?;
+            .map_err(|_| Diagnostic::lexical("integer literal is too large", line, column))?;
         Ok(Token {
             kind: TokenKind::Integer(value),
             span: self.span_from(start_byte, line, column),
@@ -167,11 +188,19 @@ impl Lexer {
                 });
             }
             if ch == '\n' {
-                return Err(Diagnostic::new("unterminated string literal", line, column));
+                return Err(Diagnostic::lexical(
+                    "unterminated string literal",
+                    line,
+                    column,
+                ));
             }
             value.push(self.lex_string_char(line, column)?);
         }
-        Err(Diagnostic::new("unterminated string literal", line, column))
+        Err(Diagnostic::lexical(
+            "unterminated string literal",
+            line,
+            column,
+        ))
     }
 
     fn lex_char(&mut self) -> XResult<Token> {
@@ -181,7 +210,11 @@ impl Lexer {
         self.advance();
         let value = self.lex_string_char(line, column)?;
         if self.peek() != Some('\'') {
-            return Err(Diagnostic::new("invalid character literal", line, column));
+            return Err(Diagnostic::lexical(
+                "invalid character literal",
+                line,
+                column,
+            ));
         }
         self.advance();
         Ok(Token {
@@ -192,7 +225,11 @@ impl Lexer {
 
     fn lex_string_char(&mut self, line: usize, column: usize) -> XResult<char> {
         let Some(ch) = self.peek() else {
-            return Err(Diagnostic::new("unterminated string literal", line, column));
+            return Err(Diagnostic::lexical(
+                "unterminated string literal",
+                line,
+                column,
+            ));
         };
         if ch != '\\' {
             self.advance();
@@ -207,13 +244,19 @@ impl Lexer {
             Some('"') => '"',
             Some('0') => '\0',
             Some(other) => {
-                return Err(Diagnostic::new(
+                return Err(Diagnostic::lexical(
                     format!("unsupported escape sequence `\\{other}`"),
                     self.line,
                     self.column,
                 ));
             }
-            None => return Err(Diagnostic::new("unterminated string literal", line, column)),
+            None => {
+                return Err(Diagnostic::lexical(
+                    "unterminated string literal",
+                    line,
+                    column,
+                ));
+            }
         };
         self.advance();
         Ok(escaped)
@@ -235,12 +278,9 @@ impl Lexer {
         let kind = match text.as_str() {
             "module" => TokenKind::Keyword(Keyword::Module),
             "import" => TokenKind::Keyword(Keyword::Import),
-            "fn" => TokenKind::Keyword(Keyword::Fn),
             "struct" => TokenKind::Keyword(Keyword::Struct),
             "enum" => TokenKind::Keyword(Keyword::Enum),
             "trait" => TokenKind::Keyword(Keyword::Trait),
-            "let" => TokenKind::Keyword(Keyword::Let),
-            "var" => TokenKind::Keyword(Keyword::Var),
             "const" => TokenKind::Keyword(Keyword::Const),
             "return" => TokenKind::Keyword(Keyword::Return),
             "if" => TokenKind::Keyword(Keyword::If),
