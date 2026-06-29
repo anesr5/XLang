@@ -1,109 +1,172 @@
-# XLang Language Specification
+# XLang
 
-XLang is a modern systems programming language designed for native performance, memory safety, fast compilation, safe concurrency, and progressive GPU integration.
+XLang is a systems programming language in early development — native performance, memory safety without a garbage collector, explicit semantics, and a path toward safe concurrency and GPU support.
 
-This repository contains the early language specification and RFC documents.
+This repository holds the **v0.1 draft specification** (RFCs) and a **bootstrap MVP compiler** that lowers directly to LLVM IR.
 
-## Project Status
+---
 
-Current version: **v0.1 draft**
+## Quick start
 
-The project is currently in the v0.1 high-assurance MVP phase. The repository contains the early language specification plus a bootstrap compiler implementation that is intended to grow under production-quality engineering constraints.
+### Prerequisites
 
-## Core Direction
+- [Rust](https://rustup.rs/) (edition 2024)
+- [LLVM 22](https://releases.llvm.org/) with development libraries
+- `clang` on `PATH` (required for `build` and `run`)
 
-XLang aims to be:
+On Windows, set `LLVM_HOME` if LLVM is not installed at `C:\Program Files\LLVM`. The build script links against the LLVM import libraries in that directory.
 
-- Native-performance
-- Memory-safe without a garbage collector
-- Explicit and predictable
-- Cross-platform
-- GPU-aware
-- Concurrency-friendly
-- AI-tooling-friendly
-- Easy to parse, format, analyze, and generate
-
-## RFC Index
-
-| RFC | Title | Status |
-|---|---|---|
-| RFC-0001 | Vision, Philosophy, and Non-Goals | Draft |
-| RFC-0002 | Syntax Principles | Draft |
-| RFC-0003 | MVP Compiler Roadmap | Draft |
-| RFC-0004 | Lexical Grammar | Draft |
-| RFC-0005 | Concrete Grammar and EBNF | Draft |
-| RFC-0006 | LLVM IR Lowering Rules | Draft |
-
-## MVP Compiler
-
-The MVP compiler lives in `compiler/` and is implemented in Rust with an Inkwell-backed direct LLVM IR backend. The project does not use C as an intermediate representation and does not include a C backend.
-
-Supported commands:
+### Build and run the demo
 
 ```bash
-cargo run --manifest-path compiler/Cargo.toml -- check examples/main.x
-cargo run --manifest-path compiler/Cargo.toml -- emit-llvm examples/main.x
-cargo run --manifest-path compiler/Cargo.toml -- build examples/main.x
 cargo run --manifest-path compiler/Cargo.toml -- run examples/main.x
-cargo run --manifest-path compiler/Cargo.toml -- emit-llvm examples/main.x --target x86_64-pc-windows-msvc
+echo $?    # Linux/macOS — expect 42
+echo %ERRORLEVEL%  # Windows — expect 42
 ```
 
-After installing or copying the built binary as `x`, the intended CLI shape is:
+The demo program adds `40 + 2` and returns `42` as the process exit code.
+
+### Install the CLI (optional)
 
 ```bash
+cargo build --manifest-path compiler/Cargo.toml --release
+# copy target/release/x.exe (or x) to a directory on your PATH as `x`
+```
+
+---
+
+## Compiler commands
+
+| Command | Description |
+|---------|-------------|
+| `check` | Lex, parse, and type-check — no codegen |
+| `emit-llvm` | Lower to LLVM IR, verify the module, print IR to stdout |
+| `build` | Write verified IR to `build/main.ll`, link with `clang` |
+| `run` | Build and execute the native binary |
+
+```bash
+# via Cargo
+cargo run --manifest-path compiler/Cargo.toml -- check  examples/main.x
+cargo run --manifest-path compiler/Cargo.toml -- emit-llvm examples/main.x
+cargo run --manifest-path compiler/Cargo.toml -- build  examples/main.x
+cargo run --manifest-path compiler/Cargo.toml -- run    examples/main.x
+
+# after installing the `x` binary
 x check examples/main.x
-x emit-llvm examples/main.x
+x emit-llvm examples/main.x --target x86_64-pc-windows-msvc
 x build examples/main.x
 x run examples/main.x
-x emit-llvm examples/main.x --target x86_64-pc-windows-msvc
 ```
 
-`check` validates the frontend phases. `emit-llvm` performs Inkwell backend lowering, verifies the LLVM module with `Module::verify()`, and prints LLVM IR. `build` writes the verified IR to `build/main.ll` and invokes `clang` to produce `build/main.exe`. `run` builds and executes that binary.
+**Target triple:** pass `--target <triple>` or set `XLANG_TARGET_TRIPLE`. When unset, the backend picks a known host triple where supported.
 
-The target triple can be configured with `--target <triple>` or `XLANG_TARGET_TRIPLE`. If neither is set, the backend uses a known host-derived target triple where supported.
+**Output paths:** `build/main.ll` and `build/main.exe` (or `build/main` on Unix).
 
-The current backend is pinned to Inkwell `0.9` with the LLVM `22.1` feature. On Windows, the bootstrap build script looks for LLVM under `LLVM_HOME` or `C:\Program Files\LLVM` and links against the installed LLVM import libraries. The official Windows LLVM package does not expose every target-initialization symbol expected by `llvm-sys`, so the MVP includes a small Windows-only shim for unused target initialization entry points.
+---
 
-RFC-0006 specifies the backend contract for direct LLVM lowering, module verification, LLVM IR snapshot tests, and configurable target triples. The current bootstrap defaults to a known host-derived target triple where supported.
+## Language subset (MVP)
 
-Current MVP backend scope: `i32`, `bool`, `void`, functions, calls, local bindings, assignments, returns, basic expressions, and `if` statements. Top-level struct declarations are parsed with semicolon-terminated fields; struct construction, field access, layout, and LLVM lowering are postponed.
-
-Compiler source is split by phase:
-
-```text
-compiler/build.rs
-compiler/src/diagnostic.rs
-compiler/src/token.rs
-compiler/src/lexer.rs
-compiler/src/ast.rs
-compiler/src/parser.rs
-compiler/src/typeck.rs
-compiler/src/backend/llvm.rs
-compiler/src/llvm_windows_shim.rs
-compiler/src/compile.rs
-compiler/src/main.rs
-```
-
-The first demo program is `examples/main.x`; with LLVM and clang installed, it returns process exit code `42`.
-
-XLang v0.1 requires semicolons after executable statements and expression statements:
+What works today:
 
 ```xlang
-let x = 40;
-return x + 2;
+module main
+
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn main() -> i32 {
+    let x = add(40, 2);
+    return x;
+}
 ```
 
-## Recommended Development Order
+| Feature | Frontend | LLVM backend |
+|---------|:--------:|:------------:|
+| `i32`, `bool`, `void` | yes | yes |
+| Functions, calls, `return` | yes | yes |
+| `let` / `var` / `const`, assignments | yes | yes |
+| `if` / `else` | yes | yes |
+| Arithmetic, comparison, `&&`, `\|\|` | yes | yes |
+| `module`, `import` (syntax only) | parsed | — |
+| `struct` declarations | parsed | — |
+| `str` literals | type-checked | rejected at codegen |
 
-1. Define the language philosophy.
-2. Define the syntax rules.
-3. Define the minimal grammar.
-4. Define primitive types.
-5. Define functions, scopes, and modules.
-6. Define structs, enums, and pattern matching.
-7. Define ownership and borrowing.
-8. Define errors as values.
-9. Define unsafe code.
-10. Build a small high-assurance compiler with deterministic diagnostics, tests, direct LLVM IR generation, and Inkwell module verification gates.
-11. Add concurrency.
-12. Add GPU support.
+Rules that matter in v0.1:
+
+- Executable statements end with `;` (newlines do not terminate statements).
+- `main` must be `fn main() -> i32` with no parameters.
+- `let` and `const` are immutable; use `var` for mutable bindings.
+- The backend uses direct LLVM lowering through [Inkwell 0.9](https://github.com/TheDan64/inkwell) (LLVM 22.1). There is **no C backend** and no C-as-IR stage.
+
+---
+
+## Project layout
+
+```text
+XLang/
+├── docs/rfcs/          Language specification (RFC-0001 … RFC-0006)
+├── compiler/           Bootstrap compiler (Rust crate `x`)
+│   └── src/
+│       ├── lexer.rs    Tokenization
+│       ├── parser.rs   Recursive descent + Pratt expressions
+│       ├── typeck.rs   Semantic analysis
+│       ├── backend/    Inkwell LLVM IR lowering
+│       └── compile.rs  Pipeline orchestration
+├── examples/           Sample programs
+│   ├── main.x
+│   ├── invalid_missing_semicolon.x
+│   └── invalid_immutable_assignment.x
+└── build/              Generated IR and binaries (gitignored)
+```
+
+---
+
+## Specification (RFCs)
+
+| RFC | Title |
+|-----|-------|
+| [RFC-0001](docs/rfcs/RFC-0001-vision-philosophy-and-non-goals.md) | Vision, philosophy, and non-goals |
+| [RFC-0002](docs/rfcs/RFC-0002-syntax-principles.md) | Syntax principles |
+| [RFC-0003](docs/rfcs/RFC-0003-mvp-compiler-roadmap.md) | MVP compiler roadmap |
+| [RFC-0004](docs/rfcs/RFC-0004-lexical-grammar.md) | Lexical grammar |
+| [RFC-0005](docs/rfcs/RFC-0005-concrete-grammar-ebnf.md) | Concrete grammar (EBNF) |
+| [RFC-0006](docs/rfcs/RFC-0006-llvm-ir-lowering-rules.md) | LLVM IR lowering rules |
+
+All RFCs are currently **Draft**.
+
+---
+
+## Development
+
+```bash
+# run the test suite (39 unit tests: lexer, parser, typeck, LLVM snapshots, diagnostics)
+cargo test --manifest-path compiler/Cargo.toml
+```
+
+Engineering constraints for the MVP:
+
+- Deterministic diagnostics with source spans
+- `Module::verify()` gate before any IR is printed, written, or linked
+- LLVM IR snapshot tests with pinned target triples
+- No generated C artifacts in the backend path
+
+On Windows, `compiler/src/llvm_windows_shim.rs` provides stub symbols for LLVM target initialization entry points missing from the official Windows LLVM installer layout.
+
+---
+
+## Roadmap (high level)
+
+1. ~~Minimal grammar and bootstrap compiler~~ (in progress)
+2. Struct layout, construction, and field access
+3. Module system and imports
+4. Ownership, borrowing, and error values
+5. Concurrency and GPU support
+
+See [RFC-0003](docs/rfcs/RFC-0003-mvp-compiler-roadmap.md) for the detailed compiler plan.
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
