@@ -245,7 +245,10 @@ impl Parser {
         let (annotation, annotation_span) = self.parse_type_with_span()?;
         let (name, name_span) = self.expect_identifier_with_span(name_message)?;
         self.expect(TokenKind::Equal, "expected `=` in binding")?;
-        let value = if matches!(annotation, TypeName::Named(_)) {
+        let value = if matches!(
+            annotation,
+            TypeName::Named(_) | TypeName::Qualified { .. }
+        ) {
             self.parse_struct_literal()?
         } else {
             self.parse_expr()?

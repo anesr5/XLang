@@ -1009,7 +1009,7 @@ fn keyword_documentation(keyword: &str) -> Option<&'static str> {
             "Declares an optional module name at the top of the file. At most once, before imports and items.",
         ),
         "import" => Some(
-            "Declares a dependency name. Parsed for syntax only; cross-file resolution is not implemented.",
+            "Declares a dependency on another module. Resolves to `M.x` or `M/main.x` under the project root (v0.4).",
         ),
         "struct" => Some(
             "Begins a struct declaration: `struct Name { type field; … }`. Use struct types in local bindings with `{ … }` literals (v0.3).",
