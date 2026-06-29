@@ -5,6 +5,7 @@ pub struct Program {
     pub module: Option<String>,
     pub imports: Vec<Import>,
     pub structs: Vec<StructDecl>,
+    pub enums: Vec<EnumDecl>,
     pub functions: Vec<Function>,
 }
 
@@ -12,6 +13,29 @@ pub struct Program {
 pub struct Import {
     pub name: String,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub pub_export: bool,
+    pub name: String,
+    pub name_span: Span,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub name_span: Span,
+    pub payload: Option<EnumPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumPayload {
+    pub ty: TypeName,
+    pub ty_span: Span,
+    pub name: String,
+    pub name_span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +101,22 @@ impl TypeName {
             _ => None,
         }
     }
+
+    pub fn enum_ref(&self) -> Option<EnumRef<'_>> {
+        match self {
+            TypeName::Named(name) => Some(EnumRef::Local(name)),
+            TypeName::Qualified { module, name } => {
+                Some(EnumRef::Qualified { module, name })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumRef<'a> {
+    Local(&'a str),
+    Qualified { module: &'a str, name: &'a str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +236,37 @@ pub enum Expr {
         field_span: Span,
         span: Span,
     },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: MatchBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchBody {
+    Expr(Expr),
+    Block(Vec<Stmt>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Variant {
+        name: String,
+        binding: Option<String>,
+        binding_span: Option<Span>,
+        span: Span,
+    },
+    Wildcard {
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -212,8 +283,45 @@ impl Expr {
             | Expr::ArrayLiteral { span, .. }
             | Expr::Index { span, .. }
             | Expr::StructLiteral { span, .. }
-            | Expr::FieldAccess { span, .. } => *span,
+            | Expr::FieldAccess { span, .. }
+            | Expr::Match { span, .. } => *span,
         }
+    }
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Variant { span, .. } | Pattern::Wildcard { span } => *span,
+        }
+    }
+}
+
+impl MatchBody {
+    pub fn span(&self) -> Span {
+        match self {
+            MatchBody::Expr(expr) => expr.span(),
+            MatchBody::Block(stmts) => stmts
+                .last()
+                .map(stmt_anchor_span)
+                .unwrap_or(Span::point(1, 1)),
+        }
+    }
+}
+
+fn stmt_anchor_span(stmt: &Stmt) -> Span {
+    match stmt {
+        Stmt::Let {
+            annotation_span,
+            name_span,
+            ..
+        } => annotation_span.unwrap_or(*name_span),
+        Stmt::Assign { name_span, .. } | Stmt::AssignIndex { name_span, .. } => *name_span,
+        Stmt::AssignField { field_span, .. } => *field_span,
+        Stmt::Return { keyword_span, .. } => *keyword_span,
+        Stmt::Expr(expr) => expr.span(),
+        Stmt::If { keyword_span, .. } | Stmt::While { keyword_span, .. } => *keyword_span,
+        Stmt::Break { keyword_span } | Stmt::Continue { keyword_span } => *keyword_span,
     }
 }
 

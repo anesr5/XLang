@@ -1526,4 +1526,137 @@ i32 main() {
         compile::check_source(SOURCE).unwrap();
         compile::emit_llvm_source(SOURCE).unwrap();
     }
+
+    #[test]
+    fn v0_5_enum_example_runs() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/v0.5/main.x");
+        compile::check(&path).unwrap();
+        compile::emit_llvm(&path).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_enum_variant() {
+        let source = r#"
+module main
+
+enum E {
+    A;
+    A;
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("duplicate variant"));
+    }
+
+    #[test]
+    fn rejects_non_exhaustive_match() {
+        let source = r#"
+module main
+
+enum OptionI32 {
+    Some(i32 value);
+    None;
+}
+
+i32 main() {
+    OptionI32 x = Some(1);
+    return match x {
+        Some(v) => v,
+    };
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("non-exhaustive match"));
+    }
+
+    #[test]
+    fn rejects_unknown_variant_constructor() {
+        let source = r#"
+module main
+
+enum OptionI32 {
+    Some(i32 value);
+    None;
+}
+
+i32 main() {
+    OptionI32 x = Nope(1);
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("unknown variant"));
+    }
+
+    #[test]
+    fn rejects_enum_constructor_arity_mismatch() {
+        let source = r#"
+module main
+
+enum OptionI32 {
+    Some(i32 value);
+    None;
+}
+
+i32 main() {
+    OptionI32 x = Some(1, 2);
+    return 0;
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("expects 1 argument"));
+    }
+
+    #[test]
+    fn rejects_match_on_non_enum() {
+        let source = r#"
+module main
+
+i32 main() {
+    i32 x = 1;
+    return match x {
+        _ => 0,
+    };
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("match scrutinee must be an enum type"));
+    }
+
+    #[test]
+    fn rejects_duplicate_type_name_struct_and_enum() {
+        let source = r#"
+module main
+
+struct Foo {
+    i32 x;
+}
+
+enum Foo {
+    A;
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("duplicate type name"));
+    }
+
+    #[test]
+    fn rejects_str_enum_payload() {
+        let source = r#"
+module main
+
+enum E {
+    A(str value);
+}
+
+i32 main() { return 0; }
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert!(err.message.contains("payload type `str` is not supported"));
+    }
 }

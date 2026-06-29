@@ -11,7 +11,10 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue,
 };
 
-use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, StructRef, TypeName, UnaryOp};
+use crate::ast::{
+    BinaryOp, EnumRef, Expr, Function, MatchArm, MatchBody, Pattern, Program, Stmt, StructRef,
+    TypeName, UnaryOp,
+};
 use crate::diagnostic::{Diagnostic, XResult};
 use crate::modules::CompilationUnit;
 
@@ -74,6 +77,24 @@ fn struct_ir_name(module_name: &str, struct_name: &str) -> String {
     format!("{module_name}.{struct_name}")
 }
 
+fn enum_ir_name(module_name: &str, enum_name: &str) -> String {
+    format!("{module_name}.{enum_name}.tagged")
+}
+
+fn enum_key_from_type(module_name: &str, ty: &TypeName) -> Option<String> {
+    match ty.enum_ref()? {
+        EnumRef::Local(name) => Some(enum_ir_name(module_name, name)),
+        EnumRef::Qualified { module, name } => Some(enum_ir_name(module, name)),
+    }
+}
+
+fn enum_key_from_ref(module_name: &str, enum_ref: EnumRef<'_>) -> String {
+    match enum_ref {
+        EnumRef::Local(name) => enum_ir_name(module_name, name),
+        EnumRef::Qualified { module, name } => enum_ir_name(module, name),
+    }
+}
+
 fn struct_key_from_type(module_name: &str, ty: &TypeName) -> Option<String> {
     match ty.struct_ref()? {
         StructRef::Local(name) => Some(struct_ir_name(module_name, name)),
@@ -91,6 +112,7 @@ struct LlvmEmitter<'ctx, 'unit> {
     program: &'unit Program,
     functions: HashMap<String, FunctionValue<'ctx>>,
     struct_types: HashMap<String, StructType<'ctx>>,
+    enum_types: HashMap<String, StructType<'ctx>>,
 }
 
 struct FunctionEmitter<'emit, 'ctx, 'unit> {
@@ -102,6 +124,7 @@ struct FunctionEmitter<'emit, 'ctx, 'unit> {
     unit: &'unit CompilationUnit,
     module_name: &'unit str,
     struct_types: &'emit HashMap<String, StructType<'ctx>>,
+    enum_types: &'emit HashMap<String, StructType<'ctx>>,
     locals: HashMap<String, Local<'ctx>>,
     loop_stack: Vec<LoopLabels<'ctx>>,
     terminated: bool,
@@ -144,12 +167,14 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             program,
             functions: HashMap::new(),
             struct_types: HashMap::new(),
+            enum_types: HashMap::new(),
         }
     }
 
     fn emit_program(&mut self) -> XResult<String> {
         self.ensure_supported()?;
         self.declare_struct_types()?;
+        self.declare_enum_types()?;
         self.declare_functions()?;
         self.declare_external_functions()?;
         for function in &self.program.functions {
@@ -201,6 +226,13 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
             }
         }
+        for enum_decl in &self.program.enums {
+            for variant in &enum_decl.variants {
+                if let Some(payload) = &variant.payload {
+                    ensure_enum_payload_backend_type(&payload.ty, payload.ty_span)?;
+                }
+            }
+        }
         for function in &self.program.functions {
             ensure_backend_type(
                 &function.return_type,
@@ -221,7 +253,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
         for struct_decl in &self.program.structs {
             struct_keys.insert(struct_ir_name(self.module_name, &struct_decl.name));
         }
-        collect_referenced_struct_types(self.program, self.module_name, &mut struct_keys);
+        collect_referenced_struct_types(self.unit, self.program, self.module_name, &mut struct_keys);
         for key in struct_keys {
             let (owner_module, struct_name) = key
                 .split_once('.')
@@ -248,6 +280,24 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 .unwrap_or_else(|| self.context.opaque_struct_type(&key));
             struct_type.set_body(&field_types, false);
             self.struct_types.insert(key, struct_type);
+        }
+        Ok(())
+    }
+
+    fn declare_enum_types(&mut self) -> XResult<()> {
+        let mut enum_keys = std::collections::HashSet::new();
+        for enum_decl in &self.program.enums {
+            enum_keys.insert(enum_ir_name(self.module_name, &enum_decl.name));
+        }
+        collect_referenced_enum_types(self.unit, self.program, self.module_name, &mut enum_keys);
+        let i32 = self.context.i32_type();
+        for key in enum_keys {
+            let enum_type = self
+                .context
+                .get_struct_type(&key)
+                .unwrap_or_else(|| self.context.opaque_struct_type(&key));
+            enum_type.set_body(&[i32.into(), i32.into()], false);
+            self.enum_types.insert(key, enum_type);
         }
         Ok(())
     }
@@ -291,6 +341,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             unit: self.unit,
             module_name: self.module_name,
             struct_types: &self.struct_types,
+            enum_types: &self.enum_types,
             locals: HashMap::new(),
             loop_stack: Vec::new(),
             terminated: false,
@@ -370,10 +421,33 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                         return Ok(());
                     }
                 }
+                if let Some(enum_ref) = annotation.as_ref().and_then(TypeName::enum_ref) {
+                    let ir_key = enum_key_from_ref(self.module_name, enum_ref);
+                    if self.enum_types.contains_key(&ir_key) {
+                        self.emit_enum_binding(
+                            name,
+                            &ir_key,
+                            annotation.as_ref().unwrap(),
+                            value,
+                            source_span,
+                        )?;
+                        return Ok(());
+                    }
+                }
                 if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
                     let ir_key = struct_key_from_ref(self.module_name, struct_ref);
-                    self.emit_struct_binding(name, &ir_key, annotation.as_ref().unwrap(), value, source_span)?;
-                } else {
+                    if self.struct_types.contains_key(&ir_key) {
+                        self.emit_struct_binding(
+                            name,
+                            &ir_key,
+                            annotation.as_ref().unwrap(),
+                            value,
+                            source_span,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                {
                     let value = self.emit_expr(value)?;
                     let Some(value) = value else {
                         return Err(Diagnostic::backend_at(
@@ -653,6 +727,82 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
         Ok(())
     }
 
+    fn emit_enum_binding(
+        &mut self,
+        name: &str,
+        enum_key: &str,
+        bound_ty: &TypeName,
+        value: &Expr,
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<()> {
+        let enum_ty = self.enum_types.get(enum_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown enum type `{enum_key}`"), source_span)
+        })?;
+        let enum_decl = enum_decl_for_key(self.unit, enum_key)?;
+        let Expr::Call { callee, args, .. } = value else {
+            return Err(Diagnostic::backend_at(
+                "enum binding requires variant constructor initializer",
+                source_span,
+            ));
+        };
+        let tag_index = variant_tag_index(enum_decl, callee)?;
+        let payload_ty = variant_payload_type(enum_decl, callee)?;
+        let i32 = self.context.i32_type();
+        let tag_value = i32.const_int(tag_index as u64, false);
+        let payload_value = if let Some(payload_ty) = payload_ty {
+            if args.len() != 1 {
+                return Err(Diagnostic::backend_at(
+                    format!("constructor `{callee}` expects 1 argument"),
+                    source_span,
+                ));
+            }
+            let rendered = self.emit_expr(&args[0])?;
+            let Some(rendered) = rendered else {
+                return Err(Diagnostic::backend_at(
+                    "cannot initialize enum with void value",
+                    args[0].span(),
+                ));
+            };
+            match payload_ty {
+                TypeName::I32 => rendered.into_int_value(),
+                TypeName::Bool => {
+                    let bool_val = rendered.into_int_value();
+                    build_value(self.builder.build_int_z_extend(
+                        bool_val,
+                        i32,
+                        "enum.payload.zext",
+                    ))?
+                }
+                _ => return Err(unsupported_backend_type(source_span)),
+            }
+        } else {
+            if !args.is_empty() {
+                return Err(Diagnostic::backend_at(
+                    format!("constructor `{callee}` expects 0 arguments"),
+                    source_span,
+                ));
+            }
+            i32.const_int(0, false)
+        };
+        let aggregate = build_enum_value(
+            self.builder,
+            *enum_ty,
+            tag_value,
+            payload_value,
+        )?;
+        let slot = build_value(self.builder.build_alloca(*enum_ty, name))?;
+        build_unit(self.builder.build_store(slot, aggregate))?;
+        self.locals.insert(
+            name.to_owned(),
+            Local {
+                pointer: slot,
+                ty: bound_ty.clone(),
+                scalar_ty: None,
+            },
+        );
+        Ok(())
+    }
+
     fn emit_struct_field_ptr(
         &mut self,
         struct_ptr: PointerValue<'ctx>,
@@ -828,6 +978,15 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                             *span,
                         ));
                     }
+                    if local.ty.enum_ref().is_some_and(|enum_ref| {
+                        let key = enum_key_from_ref(self.module_name, enum_ref);
+                        self.enum_types.contains_key(&key)
+                    }) {
+                        return Err(Diagnostic::backend_at(
+                            "cannot use enum binding as scalar value",
+                            *span,
+                        ));
+                    }
                     return Err(Diagnostic::backend_at(
                         "cannot use struct binding as scalar value",
                         *span,
@@ -935,6 +1094,15 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                     let local = self.locals.get(name).ok_or_else(|| {
                         Diagnostic::backend_at(format!("unknown variable `{name}`"), *base_span)
                     })?;
+                    if local.ty.enum_ref().is_some_and(|enum_ref| {
+                        let key = enum_key_from_ref(self.module_name, enum_ref);
+                        self.enum_types.contains_key(&key)
+                    }) {
+                        return Err(Diagnostic::backend_at(
+                            "field access requires struct binding",
+                            *field_span,
+                        ));
+                    }
                     if local.ty.struct_ref().is_none() {
                         return Err(Diagnostic::backend_at(
                             "field access requires struct binding",
@@ -954,6 +1122,233 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                     field_ptr,
                     "field.load",
                 ))?))
+            }
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => self.emit_match(scrutinee, arms, *span),
+        }
+    }
+
+    fn emit_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: crate::diagnostic::Span,
+    ) -> XResult<Option<BasicValueEnum<'ctx>>> {
+        let Expr::Variable { name, span: var_span } = scrutinee else {
+            return Err(Diagnostic::backend_at(
+                "match scrutinee must be an enum local variable",
+                scrutinee.span(),
+            ));
+        };
+        let (enum_key, enum_ty) = {
+            let local = self.locals.get(name).ok_or_else(|| {
+                Diagnostic::backend_at(format!("unknown variable `{name}`"), *var_span)
+            })?;
+            let enum_key = enum_key_from_type(self.module_name, &local.ty).ok_or_else(|| {
+                Diagnostic::backend_at("match scrutinee must be an enum type", *var_span)
+            })?;
+            let enum_ty = *self.enum_types.get(&enum_key).ok_or_else(|| {
+                Diagnostic::backend_at(format!("unknown enum type `{enum_key}`"), span)
+            })?;
+            (enum_key, enum_ty)
+        };
+        let enum_decl = enum_decl_for_key(self.unit, &enum_key)?;
+        let loaded = build_value(self.builder.build_load(
+            enum_ty,
+            self.locals[name].pointer,
+            "match.load",
+        ))?
+        .into_struct_value();
+        let tag = build_value(
+            self.builder
+                .build_extract_value(loaded, 0, "match.tag"),
+        )?
+        .into_int_value();
+        let payload_raw = build_value(
+            self.builder
+                .build_extract_value(loaded, 1, "match.payload"),
+        )?
+        .into_int_value();
+
+        let pre_match_block = current_block(self.builder)?;
+        let merge_block = self.context.append_basic_block(self.function, "match.end");
+        let trap_block = self.context.append_basic_block(self.function, "match.trap");
+
+        let mut wildcard_block: Option<BasicBlock<'ctx>> = None;
+        let mut arm_entries: Vec<(MatchArm, BasicBlock<'ctx>, Option<usize>)> = Vec::new();
+        for (index, arm) in arms.iter().enumerate() {
+            let block = self
+                .context
+                .append_basic_block(self.function, &format!("match.arm.{index}"));
+            match &arm.pattern {
+                Pattern::Wildcard { .. } => {
+                    if wildcard_block.is_some() {
+                        return Err(Diagnostic::backend_at("duplicate match arm", arm.pattern.span()));
+                    }
+                    wildcard_block = Some(block);
+                    arm_entries.push((arm.clone(), block, None));
+                }
+                Pattern::Variant { name, .. } => {
+                    let tag_index = variant_tag_index(enum_decl, name)?;
+                    arm_entries.push((arm.clone(), block, Some(tag_index)));
+                }
+            }
+        }
+
+        let default_block = wildcard_block.unwrap_or(trap_block);
+        let i32 = self.context.i32_type();
+        let mut switch_cases = Vec::new();
+        for (arm, block, tag_index) in &arm_entries {
+            if let Some(tag_index) = tag_index {
+                switch_cases.push((i32.const_int(*tag_index as u64, false), *block));
+                let _ = arm;
+            }
+        }
+        build_value(
+            self.builder
+                .build_switch(tag, default_block, &switch_cases),
+        )?;
+
+        self.builder.position_at_end(trap_block);
+        let trap = self.module.get_function("llvm.trap").unwrap_or_else(|| {
+            let fn_type = self.context.void_type().fn_type(&[], false);
+            self.module.add_function("llvm.trap", fn_type, None)
+        });
+        build_unit(self.builder.build_call(trap, &[], "trap"))?;
+        build_unit(self.builder.build_unreachable())?;
+
+        let mut phi_entries: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+        let mut result_llvm_ty: Option<BasicTypeEnum<'ctx>> = None;
+
+        for (arm, block, _) in arm_entries {
+            self.builder.position_at_end(block);
+            self.terminated = false;
+            let saved_locals = self.locals.clone();
+
+            if let Pattern::Variant {
+                name,
+                binding: Some(binding),
+                ..
+            } = &arm.pattern
+            {
+                if binding != "_"
+                    && let Some(payload_ty) = variant_payload_type(enum_decl, name)?
+                {
+                    let payload_value = match payload_ty {
+                        TypeName::I32 => payload_raw.as_basic_value_enum(),
+                        TypeName::Bool => build_value(self.builder.build_int_truncate(
+                            payload_raw,
+                            self.context.bool_type(),
+                            "match.payload.trunc",
+                        ))?
+                        .as_basic_value_enum(),
+                        _ => return Err(unsupported_backend_type(arm.pattern.span())),
+                    };
+                    let llvm_ty = llvm_basic_type(self.context, &payload_ty)?;
+                    let slot = build_value(self.builder.build_alloca(llvm_ty, binding.as_str()))?;
+                    build_unit(self.builder.build_store(slot, payload_value))?;
+                    self.locals.insert(
+                        binding.clone(),
+                        Local {
+                            pointer: slot,
+                            ty: payload_ty.clone(),
+                            scalar_ty: Some(llvm_ty),
+                        },
+                    );
+                }
+            }
+
+            let result = self.emit_match_body(&arm.body)?;
+            let Some(result) = result else {
+                return Err(Diagnostic::backend_at(
+                    "match arm cannot produce void",
+                    arm.body.span(),
+                ));
+            };
+            let llvm_ty = result.get_type();
+            if let Some(expected) = result_llvm_ty {
+                if expected != llvm_ty {
+                    return Err(Diagnostic::backend_at(
+                        "match arm type mismatch in codegen",
+                        arm.body.span(),
+                    ));
+                }
+            } else {
+                result_llvm_ty = Some(llvm_ty);
+            }
+            let arm_end = current_block(self.builder)?;
+            if !self.terminated {
+                build_unit(self.builder.build_unconditional_branch(merge_block))?;
+            }
+            phi_entries.push((result, arm_end));
+            self.locals = saved_locals;
+        }
+
+        self.builder.position_at_end(merge_block);
+        self.terminated = false;
+        let Some(result_llvm_ty) = result_llvm_ty else {
+            return Err(Diagnostic::backend_at("match must have at least one arm", span));
+        };
+        let result = if phi_entries.len() == 1 {
+            phi_entries[0].0
+        } else {
+            let phi = build_value(self.builder.build_phi(result_llvm_ty, "match.result"))?;
+            let incoming: Vec<(&dyn BasicValue<'ctx>, BasicBlock<'ctx>)> = phi_entries
+                .iter()
+                .map(|(value, block)| (value as &dyn BasicValue<'ctx>, *block))
+                .collect();
+            phi.add_incoming(&incoming);
+            phi.as_basic_value()
+        };
+        let temp = build_value(
+            self.builder
+                .build_alloca(result_llvm_ty, "match.tmp"),
+        )?;
+        build_unit(self.builder.build_store(temp, result))?;
+        let continue_block = self
+            .context
+            .append_basic_block(self.function, "match.cont");
+        build_unit(
+            self.builder
+                .build_unconditional_branch(continue_block),
+        )?;
+        self.builder.position_at_end(continue_block);
+        let loaded = build_value(self.builder.build_load(
+            result_llvm_ty,
+            temp,
+            "match.val",
+        ))?;
+        let _ = pre_match_block;
+        Ok(Some(loaded))
+    }
+
+    fn emit_match_body(&mut self, body: &MatchBody) -> XResult<Option<BasicValueEnum<'ctx>>> {
+        match body {
+            MatchBody::Expr(expr) => self.emit_expr(expr),
+            MatchBody::Block(stmts) => {
+                if stmts.is_empty() {
+                    return Err(Diagnostic::backend_at(
+                        "match arm block must end with an expression statement",
+                        body.span(),
+                    ));
+                }
+                let (prefix, last) = stmts.split_at(stmts.len() - 1);
+                for stmt in prefix {
+                    self.emit_stmt(stmt)?;
+                    if self.terminated {
+                        return Ok(None);
+                    }
+                }
+                let Stmt::Expr(expr) = &last[0] else {
+                    return Err(Diagnostic::backend_at(
+                        "match arm block must end with an expression statement",
+                        body.span(),
+                    ));
+                };
+                self.emit_expr(expr)
             }
         }
     }
@@ -1197,6 +1592,72 @@ fn ensure_expr_supported(expr: &Expr) -> XResult<()> {
             ensure_expr_supported(base)?;
             ensure_expr_supported(index)
         }
+        Expr::Match { scrutinee, arms, .. } => {
+            ensure_expr_supported(scrutinee)?;
+            for arm in arms {
+                ensure_match_body_supported(arm)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_match_body_supported(arm: &MatchArm) -> XResult<()> {
+    match &arm.body {
+        MatchBody::Expr(expr) => ensure_expr_supported(expr),
+        MatchBody::Block(stmts) => {
+            for stmt in stmts {
+                ensure_stmt_supported_in_match(stmt)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_stmt_supported_in_match(stmt: &Stmt) -> XResult<()> {
+    match stmt {
+        Stmt::Let { value, .. } => ensure_expr_supported(value),
+        Stmt::Assign { value, .. }
+        | Stmt::Return {
+            value: Some(value), ..
+        }
+        | Stmt::Expr(value) => ensure_expr_supported(value),
+        Stmt::Return { value: None, .. } => Ok(()),
+        Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+        Stmt::While { condition, body, .. } => {
+            ensure_expr_supported(condition)?;
+            for stmt in body {
+                ensure_stmt_supported_in_match(stmt)?;
+            }
+            Ok(())
+        }
+        Stmt::AssignField { value, .. } => ensure_expr_supported(value),
+        Stmt::AssignIndex { index, value, .. } => {
+            ensure_expr_supported(index)?;
+            ensure_expr_supported(value)
+        }
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => {
+            ensure_expr_supported(condition)?;
+            for stmt in then_body.iter().chain(else_body.iter()) {
+                ensure_stmt_supported_in_match(stmt)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_enum_payload_backend_type(
+    ty: &TypeName,
+    span: crate::diagnostic::Span,
+) -> XResult<()> {
+    match ty {
+        TypeName::I32 | TypeName::Bool => Ok(()),
+        _ => Err(unsupported_backend_type(span)),
     }
 }
 
@@ -1240,17 +1701,37 @@ fn ensure_local_type_supported(
         TypeName::Array { elem, .. } => ensure_array_element_backend_type(elem, span),
         TypeName::Named(name) => {
             let key = struct_ir_name(module_name, name);
-            let struct_decl = struct_decl_for_key(unit, &key)?;
-            for field in &struct_decl.fields {
-                ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+            if struct_decl_for_key(unit, &key).is_ok() {
+                let struct_decl = struct_decl_for_key(unit, &key)?;
+                for field in &struct_decl.fields {
+                    ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+                }
+                return Ok(());
+            }
+            let enum_key = enum_ir_name(module_name, name);
+            let enum_decl = enum_decl_for_key(unit, &enum_key)?;
+            for variant in &enum_decl.variants {
+                if let Some(payload) = &variant.payload {
+                    ensure_enum_payload_backend_type(&payload.ty, payload.ty_span)?;
+                }
             }
             Ok(())
         }
         TypeName::Qualified { module, name } => {
             let key = struct_ir_name(module, name);
-            let struct_decl = struct_decl_for_key(unit, &key)?;
-            for field in &struct_decl.fields {
-                ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+            if struct_decl_for_key(unit, &key).is_ok() {
+                let struct_decl = struct_decl_for_key(unit, &key)?;
+                for field in &struct_decl.fields {
+                    ensure_struct_field_backend_type(&field.ty, field.ty_span)?;
+                }
+                return Ok(());
+            }
+            let enum_key = enum_ir_name(module, name);
+            let enum_decl = enum_decl_for_key(unit, &enum_key)?;
+            for variant in &enum_decl.variants {
+                if let Some(payload) = &variant.payload {
+                    ensure_enum_payload_backend_type(&payload.ty, payload.ty_span)?;
+                }
             }
             Ok(())
         }
@@ -1318,17 +1799,73 @@ fn struct_decl_for_key<'a>(
         .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{struct_key}`"), 1, 1))
 }
 
-fn collect_referenced_struct_types(
+fn enum_decl_for_key<'a>(
+    unit: &'a CompilationUnit,
+    enum_key: &str,
+) -> XResult<&'a crate::ast::EnumDecl> {
+    let (module_name, enum_name) = enum_key
+        .strip_suffix(".tagged")
+        .and_then(|prefix| prefix.rsplit_once('.'))
+        .ok_or_else(|| Diagnostic::backend(format!("invalid enum key `{enum_key}`"), 1, 1))?;
+    let module = unit
+        .modules
+        .get(module_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown module `{module_name}`"), 1, 1))?;
+    module
+        .program
+        .enums
+        .iter()
+        .find(|decl| decl.name == enum_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown enum `{enum_key}`"), 1, 1))
+}
+
+fn variant_tag_index(enum_decl: &crate::ast::EnumDecl, variant: &str) -> XResult<usize> {
+    enum_decl
+        .variants
+        .iter()
+        .position(|v| v.name == variant)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown variant `{variant}`"), 1, 1))
+}
+
+fn variant_payload_type(
+    enum_decl: &crate::ast::EnumDecl,
+    variant: &str,
+) -> XResult<Option<TypeName>> {
+    let variant_decl = enum_decl
+        .variants
+        .iter()
+        .find(|v| v.name == variant)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown variant `{variant}`"), 1, 1))?;
+    Ok(variant_decl.payload.as_ref().map(|payload| payload.ty.clone()))
+}
+
+fn insert_enum_key_if_exists(
+    unit: &CompilationUnit,
+    module_name: &str,
+    ty: &TypeName,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    let Some(key) = enum_key_from_type(module_name, ty) else {
+        return;
+    };
+    if enum_decl_for_key(unit, &key).is_ok() {
+        keys.insert(key);
+    }
+}
+
+fn collect_referenced_enum_types(
+    unit: &CompilationUnit,
     program: &Program,
     module_name: &str,
     keys: &mut std::collections::HashSet<String>,
 ) {
     for function in &program.functions {
-        collect_struct_types_in_stmts(&function.body, module_name, keys);
+        collect_enum_types_in_stmts(unit, &function.body, module_name, keys);
     }
 }
 
-fn collect_struct_types_in_stmts(
+fn collect_enum_types_in_stmts(
+    unit: &CompilationUnit,
     stmts: &[Stmt],
     module_name: &str,
     keys: &mut std::collections::HashSet<String>,
@@ -1336,36 +1873,146 @@ fn collect_struct_types_in_stmts(
     for stmt in stmts {
         match stmt {
             Stmt::Let { annotation, value, .. } => {
-                if let Some(ty) = annotation
-                    && let Some(key) = struct_key_from_type(module_name, ty)
-                {
-                    keys.insert(key);
+                if let Some(ty) = annotation {
+                    insert_enum_key_if_exists(unit, module_name, ty, keys);
                 }
-                collect_struct_types_in_expr(value, module_name, keys);
+                collect_enum_types_in_expr(unit, value, module_name, keys);
             }
             Stmt::Assign { value, .. }
             | Stmt::Return { value: Some(value), .. }
-            | Stmt::Expr(value) => collect_struct_types_in_expr(value, module_name, keys),
+            | Stmt::Expr(value) => collect_enum_types_in_expr(unit, value, module_name, keys),
             Stmt::If {
                 condition,
                 then_body,
                 else_body,
                 ..
             } => {
-                collect_struct_types_in_expr(condition, module_name, keys);
-                collect_struct_types_in_stmts(then_body, module_name, keys);
-                collect_struct_types_in_stmts(else_body, module_name, keys);
+                collect_enum_types_in_expr(unit, condition, module_name, keys);
+                collect_enum_types_in_stmts(unit, then_body, module_name, keys);
+                collect_enum_types_in_stmts(unit, else_body, module_name, keys);
             }
             Stmt::While { condition, body, .. } => {
-                collect_struct_types_in_expr(condition, module_name, keys);
-                collect_struct_types_in_stmts(body, module_name, keys);
+                collect_enum_types_in_expr(unit, condition, module_name, keys);
+                collect_enum_types_in_stmts(unit, body, module_name, keys);
             }
             Stmt::AssignIndex { index, value, .. } => {
-                collect_struct_types_in_expr(index, module_name, keys);
-                collect_struct_types_in_expr(value, module_name, keys);
+                collect_enum_types_in_expr(unit, index, module_name, keys);
+                collect_enum_types_in_expr(unit, value, module_name, keys);
             }
             Stmt::AssignField { value, .. } => {
-                collect_struct_types_in_expr(value, module_name, keys);
+                collect_enum_types_in_expr(unit, value, module_name, keys);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_enum_types_in_expr(
+    unit: &CompilationUnit,
+    expr: &Expr,
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_enum_types_in_expr(unit, scrutinee, module_name, keys);
+            for arm in arms {
+                match &arm.body {
+                    MatchBody::Expr(expr) => {
+                        collect_enum_types_in_expr(unit, expr, module_name, keys);
+                    }
+                    MatchBody::Block(stmts) => {
+                        collect_enum_types_in_stmts(unit, stmts, module_name, keys);
+                    }
+                }
+            }
+        }
+        Expr::Call { args, .. } | Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_enum_types_in_expr(unit, arg, module_name, keys);
+            }
+        }
+        Expr::Unary { expr, .. } => collect_enum_types_in_expr(unit, expr, module_name, keys),
+        Expr::Binary { left, right, .. } => {
+            collect_enum_types_in_expr(unit, left, module_name, keys);
+            collect_enum_types_in_expr(unit, right, module_name, keys);
+        }
+        Expr::ArrayLiteral { elements, .. } | Expr::StructLiteral { elements, .. } => {
+            for element in elements {
+                collect_enum_types_in_expr(unit, element, module_name, keys);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            collect_enum_types_in_expr(unit, base, module_name, keys);
+            collect_enum_types_in_expr(unit, index, module_name, keys);
+        }
+        Expr::FieldAccess { base, .. } => collect_enum_types_in_expr(unit, base, module_name, keys),
+        _ => {}
+    }
+}
+
+fn collect_referenced_struct_types(
+    unit: &CompilationUnit,
+    program: &Program,
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    for function in &program.functions {
+        collect_struct_types_in_stmts(unit, &function.body, module_name, keys);
+    }
+}
+
+fn insert_struct_key_if_exists(
+    unit: &CompilationUnit,
+    module_name: &str,
+    ty: &TypeName,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    let Some(key) = struct_key_from_type(module_name, ty) else {
+        return;
+    };
+    if struct_decl_for_key(unit, &key).is_ok() {
+        keys.insert(key);
+    }
+}
+
+fn collect_struct_types_in_stmts(
+    unit: &CompilationUnit,
+    stmts: &[Stmt],
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { annotation, value, .. } => {
+                if let Some(ty) = annotation {
+                    insert_struct_key_if_exists(unit, module_name, ty, keys);
+                }
+                collect_struct_types_in_expr(unit, value, module_name, keys);
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::Return { value: Some(value), .. }
+            | Stmt::Expr(value) => collect_struct_types_in_expr(unit, value, module_name, keys),
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_struct_types_in_expr(unit, condition, module_name, keys);
+                collect_struct_types_in_stmts(unit, then_body, module_name, keys);
+                collect_struct_types_in_stmts(unit, else_body, module_name, keys);
+            }
+            Stmt::While { condition, body, .. } => {
+                collect_struct_types_in_expr(unit, condition, module_name, keys);
+                collect_struct_types_in_stmts(unit, body, module_name, keys);
+            }
+            Stmt::AssignIndex { index, value, .. } => {
+                collect_struct_types_in_expr(unit, index, module_name, keys);
+                collect_struct_types_in_expr(unit, value, module_name, keys);
+            }
+            Stmt::AssignField { value, .. } => {
+                collect_struct_types_in_expr(unit, value, module_name, keys);
             }
             _ => {}
         }
@@ -1373,6 +2020,7 @@ fn collect_struct_types_in_stmts(
 }
 
 fn collect_struct_types_in_expr(
+    unit: &CompilationUnit,
     expr: &Expr,
     module_name: &str,
     keys: &mut std::collections::HashSet<String>,
@@ -1380,24 +2028,37 @@ fn collect_struct_types_in_expr(
     match expr {
         Expr::Call { args, .. } | Expr::QualifiedCall { args, .. } => {
             for arg in args {
-                collect_struct_types_in_expr(arg, module_name, keys);
+                collect_struct_types_in_expr(unit, arg, module_name, keys);
             }
         }
-        Expr::Unary { expr, .. } => collect_struct_types_in_expr(expr, module_name, keys),
+        Expr::Unary { expr, .. } => collect_struct_types_in_expr(unit, expr, module_name, keys),
         Expr::Binary { left, right, .. } => {
-            collect_struct_types_in_expr(left, module_name, keys);
-            collect_struct_types_in_expr(right, module_name, keys);
+            collect_struct_types_in_expr(unit, left, module_name, keys);
+            collect_struct_types_in_expr(unit, right, module_name, keys);
         }
         Expr::ArrayLiteral { elements, .. } | Expr::StructLiteral { elements, .. } => {
             for element in elements {
-                collect_struct_types_in_expr(element, module_name, keys);
+                collect_struct_types_in_expr(unit, element, module_name, keys);
             }
         }
         Expr::Index { base, index, .. } => {
-            collect_struct_types_in_expr(base, module_name, keys);
-            collect_struct_types_in_expr(index, module_name, keys);
+            collect_struct_types_in_expr(unit, base, module_name, keys);
+            collect_struct_types_in_expr(unit, index, module_name, keys);
         }
-        Expr::FieldAccess { base, .. } => collect_struct_types_in_expr(base, module_name, keys),
+        Expr::FieldAccess { base, .. } => collect_struct_types_in_expr(unit, base, module_name, keys),
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_struct_types_in_expr(unit, scrutinee, module_name, keys);
+            for arm in arms {
+                match &arm.body {
+                    MatchBody::Expr(expr) => {
+                        collect_struct_types_in_expr(unit, expr, module_name, keys);
+                    }
+                    MatchBody::Block(stmts) => {
+                        collect_struct_types_in_stmts(unit, stmts, module_name, keys);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1548,6 +2209,19 @@ fn expect_int_value(value: Option<BasicValueEnum<'_>>) -> XResult<inkwell::value
         )));
     }
     Ok(value.into_int_value())
+}
+
+fn build_enum_value<'ctx>(
+    builder: &Builder<'ctx>,
+    enum_ty: StructType<'ctx>,
+    tag: inkwell::values::IntValue<'ctx>,
+    payload: inkwell::values::IntValue<'ctx>,
+) -> XResult<inkwell::values::StructValue<'ctx>> {
+    let undef = enum_ty.get_undef();
+    let with_tag = build_value(builder.build_insert_value(undef, tag, 0, "enum.tag"))?
+        .into_struct_value();
+    Ok(build_value(builder.build_insert_value(with_tag, payload, 1, "enum.val"))?
+        .into_struct_value())
 }
 
 fn build_value<T>(result: Result<T, inkwell::builder::BuilderError>) -> XResult<T> {

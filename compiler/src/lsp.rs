@@ -430,6 +430,40 @@ fn index_expr(
             field_span,
             ..
         } => index_field_reference(index, scope, base, field, *field_span, alloc_id),
+        Expr::Match { scrutinee, arms, .. } => {
+            index_expr(index, scrutinee, scope, alloc_id);
+            for arm in arms {
+                index_match_pattern(index, scope, &arm.pattern, alloc_id);
+                index_match_body(index, scope, &arm.body, alloc_id);
+            }
+        }
+    }
+}
+
+fn index_match_pattern(
+    index: &mut SemanticIndex,
+    scope: &HashMap<String, SymbolId>,
+    pattern: &crate::ast::Pattern,
+    alloc_id: &mut impl FnMut() -> SymbolId,
+) {
+    let _ = (index, scope, pattern, alloc_id);
+}
+
+fn index_match_body(
+    index: &mut SemanticIndex,
+    scope: &HashMap<String, SymbolId>,
+    body: &crate::ast::MatchBody,
+    alloc_id: &mut impl FnMut() -> SymbolId,
+) {
+    match body {
+        crate::ast::MatchBody::Expr(expr) => index_expr(index, expr, scope, alloc_id),
+        crate::ast::MatchBody::Block(stmts) => {
+            for stmt in stmts {
+                if let Stmt::Expr(expr) = stmt {
+                    index_expr(index, expr, scope, alloc_id);
+                }
+            }
+        }
     }
 }
 

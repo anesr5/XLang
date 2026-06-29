@@ -4,7 +4,7 @@ XLang is a systems programming language in early development — native performa
 
 This repository holds the **language specification (RFCs)** and a **bootstrap MVP compiler** that lowers directly to LLVM IR.
 
-**Current milestone:** **v0.4** — real modules, imports, multi-file compilation, `pub`, and qualified names.
+**Current milestone:** **v0.5** — algebraic enums, variant constructors, `match`, and LLVM tagged-union lowering.
 
 ---
 
@@ -33,6 +33,13 @@ echo %ERRORLEVEL%  # Windows — expect 42
 ```bash
 cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.4/main.x
 echo %ERRORLEVEL%  # expect 42 (40 + 2 via math.add)
+```
+
+**Enums and match (v0.5):**
+
+```bash
+cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.5/main.x
+echo %ERRORLEVEL%  # expect 42
 ```
 
 ### Install the CLI (optional)
@@ -96,6 +103,7 @@ pub i32 add(i32 a, i32 b) {
 | Structs, literals, field access / assign | yes | yes |
 | `module`, `import`, multi-file | yes | yes |
 | `pub`, qualified names (`math.add`) | yes | yes |
+| `enum`, constructors, `match` | yes | yes |
 | `str` literals | type-checked | rejected at codegen |
 
 Rules that matter:
@@ -115,18 +123,18 @@ XLang/
 ├── compiler/           Bootstrap compiler (Rust crate `x`)
 ├── LSP/                Experimental language server + VS Code extension
 ├── docs/
-│   ├── releases/       Release notes (v0.1–v0.4)
+│   ├── releases/       Release notes (v0.1–v0.5)
 │   ├── spec/           Language reference
 │   ├── compiler/       Compiler architecture
 │   └── rfcs/           Specification drafts
 ├── examples/
-│   ├── v0.1/ … v0.4/   Versioned sample programs
+│   ├── v0.1/ … v0.5/   Versioned sample programs
 └── build/              Generated IR and binaries (gitignored)
 ```
 
-**Release notes:** [v0.1](docs/releases/v0.1.md) · [v0.2](docs/releases/v0.2.md) · [v0.3](docs/releases/v0.3.md) · [v0.4](docs/releases/v0.4.md)
+**Release notes:** [v0.1](docs/releases/v0.1.md) · [v0.2](docs/releases/v0.2.md) · [v0.3](docs/releases/v0.3.md) · [v0.4](docs/releases/v0.4.md) · [v0.5](docs/releases/v0.5.md)
 
-**Examples:** [v0.4 multi-module](examples/v0.4/)
+**Examples:** [v0.4 multi-module](examples/v0.4/) · [v0.5 enums](examples/v0.5/)
 
 ---
 
@@ -144,6 +152,13 @@ XLang/
 | [RFC-0028](docs/rfcs/RFC-0028-multi-file-compilation.md) | Multi-file compilation |
 | [RFC-0029](docs/rfcs/RFC-0029-llvm-linking-and-symbol-names.md) | LLVM linking and symbol names |
 | [RFC-0030](docs/rfcs/RFC-0030-v0-4-diagnostics.md) | v0.4 diagnostics |
+| [RFC-0031](docs/rfcs/RFC-0031-v0-5-roadmap-and-scope.md) | v0.5 roadmap and scope (enums) |
+| [RFC-0032](docs/rfcs/RFC-0032-enum-declarations.md) | Enum declarations |
+| [RFC-0033](docs/rfcs/RFC-0033-enum-constructors-and-payloads.md) | Enum constructors and payloads |
+| [RFC-0034](docs/rfcs/RFC-0034-match-expressions-and-exhaustiveness.md) | Match and exhaustiveness |
+| [RFC-0035](docs/rfcs/RFC-0035-option-and-result-conventions.md) | Option and Result conventions |
+| [RFC-0036](docs/rfcs/RFC-0036-llvm-enum-lowering.md) | LLVM enum lowering |
+| [RFC-0037](docs/rfcs/RFC-0037-v0-5-diagnostics.md) | v0.5 diagnostics |
 
 Full RFC index in previous README sections; all RFCs are **Draft** unless noted in release notes.
 
@@ -170,8 +185,9 @@ Engineering constraints:
 2. ~~v0.2: loops and fixed-size arrays~~
 3. ~~v0.3: structs~~
 4. ~~**v0.4:** modules, imports, multi-file, `pub`, qualified names~~
-5. Ownership, borrowing, and error values
-6. Concurrency and GPU support
+5. ~~**v0.5:** enums, constructors, `match`, tagged-union lowering~~
+6. Ownership, borrowing, and error values in function signatures
+7. Concurrency and GPU support
 
 See [RFC-0003](docs/rfcs/RFC-0003-mvp-compiler-roadmap.md) for the detailed compiler plan.
 

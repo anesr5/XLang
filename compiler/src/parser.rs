@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinaryOp, Expr, Field, Function, Import, Param, Program, Stmt, StructDecl, TypeName,
-    UnaryOp,
+    BinaryOp, EnumDecl, EnumPayload, EnumVariant, Expr, Field, Function, Import, MatchArm,
+    MatchBody, Param, Pattern, Program, Stmt, StructDecl, TypeName, UnaryOp,
 };
 use crate::diagnostic::{Diagnostic, XResult};
 use crate::token::{Keyword, Token, TokenKind};
@@ -34,10 +34,13 @@ impl Parser {
         }
 
         let mut structs = Vec::new();
+        let mut enums = Vec::new();
         let mut functions = Vec::new();
         while !self.is_at_end() {
             if self.check_keyword(Keyword::Struct) {
                 structs.push(self.parse_struct()?);
+            } else if self.check_keyword(Keyword::Enum) {
+                enums.push(self.parse_enum()?);
             } else {
                 functions.push(self.parse_function()?);
             }
@@ -47,7 +50,51 @@ impl Parser {
             module,
             imports,
             structs,
+            enums,
             functions,
+        })
+    }
+
+    fn parse_enum(&mut self) -> XResult<EnumDecl> {
+        let pub_export = self.parse_visibility();
+        self.expect_keyword(Keyword::Enum, "expected `enum` declaration")?;
+        let (name, name_span) = self.expect_identifier_with_span("expected enum name")?;
+        self.expect(TokenKind::LeftBrace, "expected `{` after enum name")?;
+        let mut variants = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            variants.push(self.parse_enum_variant()?);
+        }
+        self.expect(TokenKind::RightBrace, "expected `}` after enum body")?;
+        Ok(EnumDecl {
+            pub_export,
+            name,
+            name_span,
+            variants,
+        })
+    }
+
+    fn parse_enum_variant(&mut self) -> XResult<EnumVariant> {
+        let (name, name_span) = self.expect_identifier_with_span("expected variant name")?;
+        let payload = if self.match_token(&TokenKind::LeftParen) {
+            let (ty, ty_span) = self.parse_type_with_span()?;
+            let (field_name, field_name_span) =
+                self.expect_identifier_with_span("expected payload binding name")?;
+            self.expect(TokenKind::RightParen, "expected `)` after payload")?;
+            self.expect(TokenKind::Semicolon, "expected `;` after variant")?;
+            Some(EnumPayload {
+                ty,
+                ty_span,
+                name: field_name,
+                name_span: field_name_span,
+            })
+        } else {
+            self.expect(TokenKind::Semicolon, "expected `;` after variant")?;
+            None
+        };
+        Ok(EnumVariant {
+            name,
+            name_span,
+            payload,
         })
     }
 
@@ -249,7 +296,11 @@ impl Parser {
             annotation,
             TypeName::Named(_) | TypeName::Qualified { .. }
         ) {
-            self.parse_struct_literal()?
+            if self.check(&TokenKind::LeftBrace) {
+                self.parse_struct_literal()?
+            } else {
+                self.parse_expr()?
+            }
         } else {
             self.parse_expr()?
         };
@@ -546,6 +597,7 @@ impl Parser {
                 value: false,
                 span: token.span,
             }),
+            TokenKind::Keyword(Keyword::Match) => self.parse_match_expr(token.span),
             TokenKind::Identifier(name) => {
                 if self.match_token(&TokenKind::LeftParen) {
                     let mut args = Vec::new();
@@ -700,6 +752,74 @@ impl Parser {
 
     fn is_at_end(&self) -> bool {
         matches!(self.current().kind, TokenKind::Eof)
+    }
+
+    fn parse_match_expr(&mut self, start: crate::diagnostic::Span) -> XResult<Expr> {
+        let scrutinee = self.parse_expr()?;
+        self.expect(TokenKind::LeftBrace, "expected `{` after match scrutinee")?;
+        let mut arms = Vec::new();
+        if !self.check(&TokenKind::RightBrace) {
+            loop {
+                arms.push(self.parse_match_arm()?);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightBrace) {
+                    break;
+                }
+            }
+        }
+        let end = self.current().span;
+        self.expect(TokenKind::RightBrace, "expected `}` after match arms")?;
+        Ok(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: start.join(end),
+        })
+    }
+
+    fn parse_match_arm(&mut self) -> XResult<MatchArm> {
+        let pattern = self.parse_pattern()?;
+        self.expect(TokenKind::FatArrow, "expected `=>` after match pattern")?;
+        let arm_start = pattern.span();
+        let body = if self.check(&TokenKind::LeftBrace) {
+            MatchBody::Block(self.parse_block()?)
+        } else {
+            MatchBody::Expr(self.parse_expr()?)
+        };
+        let span = arm_start.join(body.span());
+        Ok(MatchArm {
+            pattern,
+            body,
+            span,
+        })
+    }
+
+    fn parse_pattern(&mut self) -> XResult<Pattern> {
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "_") {
+            let span = self.advance().span;
+            return Ok(Pattern::Wildcard { span });
+        }
+        let (name, name_span) = self.expect_identifier_with_span("expected match pattern")?;
+        let start = name_span;
+        if self.match_token(&TokenKind::LeftParen) {
+            let (binding, binding_span) =
+                self.expect_identifier_with_span("expected payload binding name")?;
+            self.expect(TokenKind::RightParen, "expected `)` after pattern binding")?;
+            Ok(Pattern::Variant {
+                name,
+                binding: Some(binding),
+                binding_span: Some(binding_span),
+                span: start.join(binding_span),
+            })
+        } else {
+            Ok(Pattern::Variant {
+                name,
+                binding: None,
+                binding_span: None,
+                span: start,
+            })
+        }
     }
 
     fn peek_qualified_call(&self) -> bool {

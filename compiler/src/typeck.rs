@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, StructRef, TypeName, UnaryOp};
+use crate::ast::{
+    BinaryOp, EnumRef, Expr, Function, MatchArm, MatchBody, Pattern, Program, Stmt, StructRef,
+    TypeName, UnaryOp,
+};
 use crate::diagnostic::{Diagnostic, Span, XResult};
 use crate::modules::{CompilationUnit, LoadedModule};
 
@@ -21,9 +24,16 @@ struct StructLayout {
 }
 
 #[derive(Debug, Clone)]
+struct EnumLayout {
+    variants: Vec<(String, Option<TypeName>)>,
+    pub_export: bool,
+}
+
+#[derive(Debug, Clone)]
 struct ModuleExports {
     functions: HashMap<String, FunctionSig>,
     structs: HashMap<String, StructLayout>,
+    enums: HashMap<String, EnumLayout>,
 }
 
 pub fn check_unit(unit: &CompilationUnit) -> XResult<()> {
@@ -45,6 +55,7 @@ struct TypeChecker<'a> {
     exports: &'a HashMap<String, ModuleExports>,
     functions: HashMap<String, FunctionSig>,
     structs: HashMap<String, StructLayout>,
+    enums: HashMap<String, EnumLayout>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -64,7 +75,10 @@ impl<'a> TypeChecker<'a> {
     ) -> XResult<Self> {
         let program = &module.program;
         let structs = build_struct_layouts(program, module.implicit_pub)?;
+        let enums = build_enum_layouts(program, module.implicit_pub)?;
+        validate_type_names(program, &structs, &enums)?;
         validate_structs(unit, module.name.as_str(), program, &structs, exports)?;
+        validate_enums(program, &enums)?;
         let mut functions = HashMap::new();
         for function in &program.functions {
             if functions.contains_key(&function.name) {
@@ -92,6 +106,7 @@ impl<'a> TypeChecker<'a> {
             exports,
             functions,
             structs,
+            enums,
         })
     }
 
@@ -167,7 +182,18 @@ impl<'a> TypeChecker<'a> {
                         annotation_span.unwrap_or(*name_span),
                     ));
                 }
-                let binding_ty = if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
+                let binding_ty = if let Some(enum_ref) =
+                    annotation.as_ref().and_then(TypeName::enum_ref)
+                    && self.is_known_enum(enum_ref, annotation_span.unwrap_or(*name_span))
+                {
+                    self.check_enum_constructor(
+                        enum_ref,
+                        value,
+                        annotation_span.unwrap_or(*name_span),
+                        locals,
+                    )?;
+                    annotation.clone().unwrap()
+                } else if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
                     self.validate_struct_local_type(struct_ref, annotation_span.unwrap_or(*name_span))?;
                     if !matches!(value, Expr::StructLiteral { .. }) {
                         return Err(Diagnostic::type_error_at(
@@ -236,9 +262,9 @@ impl<'a> TypeChecker<'a> {
                         *name_span,
                     ));
                 }
-                if matches!(target_ty, TypeName::Named(_) | TypeName::Qualified { .. }) {
+                if self.is_enum_local_type(target_ty) || target_ty.struct_ref().is_some() {
                     return Err(Diagnostic::type_error_at(
-                        format!("cannot assign to struct binding `{name}` as a whole"),
+                        format!("cannot assign to enum or struct binding `{name}` as a whole"),
                         *name_span,
                     ));
                 }
@@ -345,7 +371,11 @@ impl<'a> TypeChecker<'a> {
                 keyword_span,
             } => {
                 let actual = if let Some(expr) = value {
-                    let actual = self.check_expr(expr, locals)?;
+                    let actual = if expected_return.enum_ref().is_some() {
+                        self.check_expr_for_type(expr, locals, expected_return)?
+                    } else {
+                        self.check_expr(expr, locals)?
+                    };
                     if actual == TypeName::Void {
                         return Err(Diagnostic::type_error_at(
                             "cannot return a void expression; use `return;`",
@@ -605,8 +635,258 @@ impl<'a> TypeChecker<'a> {
                     ));
                 };
                 let struct_ref = base_ty.struct_ref().expect("struct ref");
+                if self.is_enum_local_type(base_ty) {
+                    return Err(Diagnostic::type_error_at(
+                        "cannot access field on enum value",
+                        *field_span,
+                    ));
+                }
                 let (_, field_ty) = self.resolve_struct_field(struct_ref, field, *field_span)?;
                 Ok(field_ty.clone())
+            }
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => self.check_match(scrutinee, arms, locals, *span),
+        }
+    }
+
+    fn check_match(
+        &self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        locals: &HashMap<String, (TypeName, bool)>,
+        span: Span,
+    ) -> XResult<TypeName> {
+        let scrutinee_ty = self.check_expr(scrutinee, locals)?;
+        let Some(enum_ref) = scrutinee_ty.enum_ref() else {
+            return Err(Diagnostic::type_error_at(
+                "match scrutinee must be an enum type",
+                scrutinee.span(),
+            ));
+        };
+        let layout = self.resolve_enum_layout(enum_ref, scrutinee.span())?;
+        let mut covered = HashSet::new();
+        let mut has_wildcard = false;
+        let mut arm_ty: Option<TypeName> = None;
+        for arm in arms {
+            match &arm.pattern {
+                Pattern::Wildcard { .. } => {
+                    if has_wildcard {
+                        return Err(Diagnostic::type_error_at(
+                            "duplicate match arm",
+                            arm.pattern.span(),
+                        ));
+                    }
+                    has_wildcard = true;
+                }
+                Pattern::Variant { name, binding, .. } => {
+                    if !covered.insert(name.clone()) {
+                        return Err(Diagnostic::type_error_at(
+                            format!("duplicate match arm `{name}`"),
+                            arm.pattern.span(),
+                        ));
+                    }
+                    let Some((_, payload)) = layout.variants.iter().find(|(v, _)| v == name) else {
+                        return Err(Diagnostic::type_error_at(
+                            format!("unknown variant `{name}` in match pattern"),
+                            arm.pattern.span(),
+                        ));
+                    };
+                    if payload.is_some() != binding.is_some() {
+                        return Err(Diagnostic::type_error_at(
+                            format!("pattern `{name}` payload mismatch"),
+                            arm.pattern.span(),
+                        ));
+                    }
+                }
+            }
+            let mut arm_locals = locals.clone();
+            if let Pattern::Variant {
+                name,
+                binding: Some(binding),
+                binding_span: Some(binding_span),
+                ..
+            } = &arm.pattern
+            {
+                if binding != "_"
+                    && let Some((_, Some(payload_ty))) =
+                        layout.variants.iter().find(|(v, _)| v == name)
+                {
+                    arm_locals.insert(binding.clone(), (payload_ty.clone(), false));
+                    let _ = binding_span;
+                }
+            }
+            let body_ty = self.check_match_body(&arm.body, &mut arm_locals, span)?;
+            if body_ty == TypeName::Void {
+                return Err(Diagnostic::type_error_at(
+                    "match arm cannot produce void",
+                    arm.body.span(),
+                ));
+            }
+            if let Some(expected) = &arm_ty {
+                if expected != &body_ty {
+                    return Err(Diagnostic::type_error_at(
+                        format!(
+                            "match arm type mismatch: expected {}, got {}",
+                            type_name_display(expected),
+                            type_name_display(&body_ty)
+                        ),
+                        arm.body.span(),
+                    ));
+                }
+            } else {
+                arm_ty = Some(body_ty);
+            }
+        }
+        if !has_wildcard {
+            for (variant, _) in &layout.variants {
+                if !covered.contains(variant) {
+                    return Err(Diagnostic::type_error_at(
+                        format!("non-exhaustive match: missing variant `{variant}`"),
+                        span,
+                    ));
+                }
+            }
+        }
+        arm_ty.ok_or_else(|| Diagnostic::type_error_at("match must have at least one arm", span))
+    }
+
+    fn check_match_body(
+        &self,
+        body: &MatchBody,
+        locals: &mut HashMap<String, (TypeName, bool)>,
+        _span: Span,
+    ) -> XResult<TypeName> {
+        match body {
+            MatchBody::Expr(expr) => self.check_expr(expr, locals),
+            MatchBody::Block(stmts) => {
+                let mut declared = HashSet::new();
+                for stmt in stmts {
+                    self.check_stmt(stmt, locals, &mut declared, &TypeName::I32, 0)?;
+                }
+                let Some(Stmt::Expr(expr)) = stmts.last() else {
+                    return Err(Diagnostic::type_error_at(
+                        "match arm block must end with an expression statement",
+                        body.span(),
+                    ));
+                };
+                self.check_expr(expr, locals)
+            }
+        }
+    }
+
+    fn check_enum_constructor(
+        &self,
+        enum_ref: EnumRef<'_>,
+        value: &Expr,
+        span: Span,
+        locals: &HashMap<String, (TypeName, bool)>,
+    ) -> XResult<()> {
+        let Expr::Call {
+            callee, args, ..
+        } = value
+        else {
+            return Err(Diagnostic::type_error_at(
+                "enum local requires variant constructor initializer",
+                value.span(),
+            ));
+        };
+        let layout = self.resolve_enum_layout(enum_ref, span)?;
+        let Some((_, payload)) = layout.variants.iter().find(|(name, _)| name == callee) else {
+            return Err(Diagnostic::type_error_at(
+                format!("unknown variant `{callee}`"),
+                value.span(),
+            ));
+        };
+        match payload {
+            None => {
+                if !args.is_empty() {
+                    return Err(Diagnostic::type_error_at(
+                        format!("constructor `{callee}` expects 0 arguments"),
+                        value.span(),
+                    ));
+                }
+            }
+            Some(expected_ty) => {
+                if args.len() != 1 {
+                    return Err(Diagnostic::type_error_at(
+                        format!("constructor `{callee}` expects 1 argument"),
+                        value.span(),
+                    ));
+                }
+                let actual = self.check_expr(&args[0], locals)?;
+                if &actual != expected_ty {
+                    return Err(Diagnostic::type_error_at(
+                        format!(
+                            "constructor argument type mismatch: expected {}, got {}",
+                            type_name_display(expected_ty),
+                            type_name_display(&actual)
+                        ),
+                        args[0].span(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_expr_for_type(
+        &self,
+        expr: &Expr,
+        locals: &HashMap<String, (TypeName, bool)>,
+        expected: &TypeName,
+    ) -> XResult<TypeName> {
+        if let Some(enum_ref) = expected.enum_ref()
+            && self.is_known_enum(enum_ref, expr.span())
+            && matches!(expr, Expr::Call { .. })
+        {
+            self.check_enum_constructor(enum_ref, expr, expr.span(), locals)?;
+            return Ok(expected.clone());
+        }
+        let actual = self.check_expr(expr, locals)?;
+        if &actual != expected {
+            return Err(Diagnostic::type_error_at(
+                format!(
+                    "expected {}, got {}",
+                    type_name_display(expected),
+                    type_name_display(&actual)
+                ),
+                expr.span(),
+            ));
+        }
+        Ok(actual)
+    }
+
+    fn is_known_enum(&self, enum_ref: EnumRef<'_>, span: Span) -> bool {
+        self.resolve_enum_layout(enum_ref, span).is_ok()
+    }
+
+    fn is_enum_local_type(&self, ty: &TypeName) -> bool {
+        ty.enum_ref()
+            .and_then(|r| self.resolve_enum_layout(r, Span::point(1, 1)).ok())
+            .is_some()
+    }
+
+    fn resolve_enum_layout(&self, enum_ref: EnumRef<'_>, span: Span) -> XResult<&EnumLayout> {
+        match enum_ref {
+            EnumRef::Local(name) => self.enums.get(name).ok_or_else(|| {
+                Diagnostic::type_error_at(format!("unknown enum type `{name}`"), span)
+            }),
+            EnumRef::Qualified { module, name } => {
+                if module != self.module_name && !self.imports.contains(module) {
+                    return Err(Diagnostic::type_error_at(
+                        format!("unknown module `{module}`"),
+                        span,
+                    ));
+                }
+                let module_exports = self.exports.get(module).ok_or_else(|| {
+                    Diagnostic::type_error_at(format!("unknown module `{module}`"), span)
+                })?;
+                module_exports.enums.get(name).ok_or_else(|| {
+                    Diagnostic::type_error_at(format!("unknown enum type `{module}.{name}`"), span)
+                })
             }
         }
     }
@@ -999,10 +1279,123 @@ fn struct_ref_display(struct_ref: StructRef<'_>) -> String {
     }
 }
 
+fn build_enum_layouts(
+    program: &Program,
+    implicit_pub: bool,
+) -> XResult<HashMap<String, EnumLayout>> {
+    let mut enums = HashMap::new();
+    for enum_decl in &program.enums {
+        let variants = enum_decl
+            .variants
+            .iter()
+            .map(|variant| {
+                (
+                    variant.name.clone(),
+                    variant.payload.as_ref().map(|p| p.ty.clone()),
+                )
+            })
+            .collect();
+        enums.insert(
+            enum_decl.name.clone(),
+            EnumLayout {
+                variants,
+                pub_export: enum_decl.pub_export || implicit_pub,
+            },
+        );
+    }
+    Ok(enums)
+}
+
+fn validate_type_names(
+    program: &Program,
+    structs: &HashMap<String, StructLayout>,
+    enums: &HashMap<String, EnumLayout>,
+) -> XResult<()> {
+    for struct_decl in &program.structs {
+        if enums.contains_key(&struct_decl.name) {
+            return Err(Diagnostic::type_error_at(
+                format!("duplicate type name `{}`", struct_decl.name),
+                struct_decl.name_span,
+            ));
+        }
+    }
+    for enum_decl in &program.enums {
+        if structs.contains_key(&enum_decl.name) {
+            return Err(Diagnostic::type_error_at(
+                format!("duplicate type name `{}`", enum_decl.name),
+                enum_decl.name_span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_enums(program: &Program, layouts: &HashMap<String, EnumLayout>) -> XResult<()> {
+    let mut enum_names = HashSet::new();
+    for enum_decl in &program.enums {
+        if !enum_names.insert(enum_decl.name.clone()) {
+            return Err(Diagnostic::type_error_at(
+                format!("duplicate enum `{}`", enum_decl.name),
+                enum_decl.name_span,
+            ));
+        }
+        if enum_decl.variants.is_empty() {
+            return Err(Diagnostic::type_error_at(
+                format!("enum `{}` must have at least one variant", enum_decl.name),
+                enum_decl.name_span,
+            ));
+        }
+        let mut variant_names = HashSet::new();
+        for variant in &enum_decl.variants {
+            if !variant_names.insert(variant.name.clone()) {
+                return Err(Diagnostic::type_error_at(
+                    format!(
+                        "duplicate variant `{}` in enum `{}`",
+                        variant.name, enum_decl.name
+                    ),
+                    variant.name_span,
+                ));
+            }
+            if let Some(payload) = &variant.payload {
+                validate_enum_payload_type(&enum_decl.name, &payload.ty, payload.ty_span)?;
+            }
+        }
+        let _ = layouts;
+    }
+    Ok(())
+}
+
+fn validate_enum_payload_type(enum_name: &str, ty: &TypeName, span: Span) -> XResult<()> {
+    match ty {
+        TypeName::I32 | TypeName::Bool => Ok(()),
+        TypeName::Str => Err(Diagnostic::type_error_at(
+            format!("payload type `str` is not supported in enum `{enum_name}` yet"),
+            span,
+        )),
+        TypeName::Void => Err(Diagnostic::type_error_at(
+            format!("payload type cannot be void in enum `{enum_name}`"),
+            span,
+        )),
+        TypeName::Named(name) => Err(Diagnostic::type_error_at(
+            format!("unknown payload type `{name}` in enum `{enum_name}`"),
+            span,
+        )),
+        TypeName::Qualified { module, name } => Err(Diagnostic::type_error_at(
+            format!("qualified payload type `{module}.{name}` is not supported yet"),
+            span,
+        )),
+        TypeName::Array { .. } => Err(Diagnostic::type_error_at(
+            format!("array payload types are not supported in enum `{enum_name}` yet"),
+            span,
+        )),
+    }
+}
+
 fn build_unit_exports(unit: &CompilationUnit) -> XResult<HashMap<String, ModuleExports>> {
     let mut exports = HashMap::new();
     for module in unit.modules.values() {
         let structs = build_struct_layouts(&module.program, module.implicit_pub)?;
+        let enums = build_enum_layouts(&module.program, module.implicit_pub)?;
         let mut functions = HashMap::new();
         for function in &module.program.functions {
             functions.insert(
@@ -1019,7 +1412,11 @@ fn build_unit_exports(unit: &CompilationUnit) -> XResult<HashMap<String, ModuleE
         }
         exports.insert(
             module.name.clone(),
-            ModuleExports { functions, structs },
+            ModuleExports {
+                functions,
+                structs,
+                enums,
+            },
         );
     }
     Ok(exports)
