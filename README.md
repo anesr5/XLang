@@ -4,7 +4,7 @@ XLang is a systems programming language in early development — native performa
 
 This repository holds the **language specification (RFCs)** and a **bootstrap MVP compiler** that lowers directly to LLVM IR.
 
-**Current milestone:** **v0.6** — enum types in function signatures, cross-module `pub enum`, and fallible calls.
+**Current milestone:** **v0.7** — struct values in function signatures and cross-module `pub struct` APIs.
 
 ---
 
@@ -47,6 +47,13 @@ echo %ERRORLEVEL%  # expect 42
 ```bash
 cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.6/main.x
 echo %ERRORLEVEL%  # expect 5 (10 / 2 via math.divide)
+```
+
+**Struct values across modules (v0.7):**
+
+```bash
+cargo run --manifest-path compiler/Cargo.toml -- run examples/v0.7/main.x
+echo %ERRORLEVEL%  # expect 11 (5 + 6 via geom.Point)
 ```
 
 ### Install the CLI (optional)
@@ -112,6 +119,7 @@ pub i32 add(i32 a, i32 b) {
 | `pub`, qualified names (`math.add`) | yes | yes |
 | `enum`, constructors, `match` | yes | yes |
 | Enum fn params / returns | yes | yes |
+| Struct fn params / returns | yes | yes |
 | `str` literals | type-checked | rejected at codegen |
 
 Rules that matter:
@@ -131,18 +139,18 @@ XLang/
 ├── compiler/           Bootstrap compiler (Rust crate `x`)
 ├── LSP/                Experimental language server + VS Code extension
 ├── docs/
-│   ├── releases/       Release notes (v0.1–v0.6)
+│   ├── releases/       Release notes (v0.1–v0.7)
 │   ├── spec/           Language reference
 │   ├── compiler/       Compiler architecture
 │   └── rfcs/           Specification drafts
 ├── examples/
-│   ├── v0.1/ … v0.6/   Versioned sample programs
+│   ├── v0.1/ … v0.7/   Versioned sample programs
 └── build/              Generated IR and binaries (gitignored)
 ```
 
-**Release notes:** [v0.1](docs/releases/v0.1.md) · [v0.2](docs/releases/v0.2.md) · [v0.3](docs/releases/v0.3.md) · [v0.4](docs/releases/v0.4.md) · [v0.5](docs/releases/v0.5.md) · [v0.6](docs/releases/v0.6.md)
+**Release notes:** [v0.1](docs/releases/v0.1.md) · [v0.2](docs/releases/v0.2.md) · [v0.3](docs/releases/v0.3.md) · [v0.4](docs/releases/v0.4.md) · [v0.5](docs/releases/v0.5.md) · [v0.6](docs/releases/v0.6.md) · [v0.7](docs/releases/v0.7.md)
 
-**Examples:** [v0.4 multi-module](examples/v0.4/) · [v0.5 enums](examples/v0.5/) · [v0.6 enum returns](examples/v0.6/)
+**Examples:** [v0.4 multi-module](examples/v0.4/) · [v0.5 enums](examples/v0.5/) · [v0.6 enum returns](examples/v0.6/) · [v0.7 struct ABI](examples/v0.7/)
 
 ---
 
@@ -201,8 +209,9 @@ Engineering constraints:
 4. ~~**v0.4:** modules, imports, multi-file, `pub`, qualified names~~
 5. ~~**v0.5:** enums, constructors, `match`, tagged-union lowering~~
 6. ~~**v0.6:** enum types in function signatures and cross-module fallible calls~~
-7. **v0.7:** struct pass/return ABI ([RFC-0043](docs/rfcs/RFC-0043-v0-7-struct-pass-return-abi.md))
-8. Concurrency and GPU support
+7. ~~**v0.7:** struct pass/return ABI ([RFC-0043](docs/rfcs/RFC-0043-v0-7-struct-pass-return-abi.md))~~
+8. Ownership and borrowing
+9. Concurrency and GPU support
 
 See [RFC-0003](docs/rfcs/RFC-0003-mvp-compiler-roadmap.md) for the detailed compiler plan.
 

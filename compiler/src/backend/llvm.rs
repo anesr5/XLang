@@ -214,6 +214,18 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                     .map(|param| param.ty.clone())
                     .collect::<Vec<_>>(),
             )?;
+            ensure_declared_struct_types_for_signature(
+                self.context,
+                self.unit,
+                &import_module,
+                &mut self.struct_types,
+                &target_fn.return_type,
+                &target_fn
+                    .params
+                    .iter()
+                    .map(|param| param.ty.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             let symbol = mangle_function(&import_module, &callee, false);
             if self.functions.contains_key(&symbol) {
                 continue;
@@ -224,6 +236,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 .map(|param| {
                     llvm_basic_type(
                         self.context,
+                        &self.struct_types,
                         &self.enum_types,
                         self.unit,
                         &import_module,
@@ -236,6 +249,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 TypeName::Void => self.context.void_type().fn_type(&params, false),
                 _ => llvm_basic_type(
                     self.context,
+                    &self.struct_types,
                     &self.enum_types,
                     self.unit,
                     &import_module,
@@ -290,6 +304,12 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
             struct_keys.insert(struct_ir_name(self.module_name, &struct_decl.name));
         }
         collect_referenced_struct_types(
+            self.unit,
+            self.program,
+            self.module_name,
+            &mut struct_keys,
+        );
+        collect_struct_types_in_signatures(
             self.unit,
             self.program,
             self.module_name,
@@ -350,6 +370,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 .map(|param| {
                     llvm_basic_type(
                         self.context,
+                        &self.struct_types,
                         &self.enum_types,
                         self.unit,
                         self.module_name,
@@ -362,6 +383,7 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 TypeName::Void => self.context.void_type().fn_type(&params, false),
                 _ => llvm_basic_type(
                     self.context,
+                    &self.struct_types,
                     &self.enum_types,
                     self.unit,
                     self.module_name,
@@ -414,6 +436,27 @@ impl<'ctx, 'unit> LlvmEmitter<'ctx, 'unit> {
                 let slot = build_value(
                     self.builder
                         .build_alloca(enum_ty, &format!("{}.addr", param.name)),
+                )?;
+                build_unit(self.builder.build_store(slot, value))?;
+                emitter.locals.insert(
+                    param.name.clone(),
+                    Local {
+                        pointer: slot,
+                        ty: param.ty.clone(),
+                        scalar_ty: None,
+                    },
+                );
+            } else if let Some(struct_key) = struct_key_from_type(self.module_name, &param.ty)
+                && self.struct_types.contains_key(&struct_key)
+            {
+                let struct_ty = self
+                    .struct_types
+                    .get(&struct_key)
+                    .copied()
+                    .expect("struct type");
+                let slot = build_value(
+                    self.builder
+                        .build_alloca(struct_ty, &format!("{}.addr", param.name)),
                 )?;
                 build_unit(self.builder.build_store(slot, value))?;
                 emitter.locals.insert(
@@ -521,13 +564,23 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                 if let Some(struct_ref) = annotation.as_ref().and_then(TypeName::struct_ref) {
                     let ir_key = struct_key_from_ref(self.module_name, struct_ref);
                     if self.struct_types.contains_key(&ir_key) {
-                        self.emit_struct_binding(
-                            name,
-                            &ir_key,
-                            annotation.as_ref().unwrap(),
-                            value,
-                            source_span,
-                        )?;
+                        if matches!(value, Expr::StructLiteral { .. }) {
+                            self.emit_struct_binding(
+                                name,
+                                &ir_key,
+                                annotation.as_ref().unwrap(),
+                                value,
+                                source_span,
+                            )?;
+                        } else {
+                            self.emit_struct_from_expr(
+                                name,
+                                &ir_key,
+                                annotation.as_ref().unwrap(),
+                                value,
+                                source_span,
+                            )?;
+                        }
                         return Ok(());
                     }
                 }
@@ -800,6 +853,78 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
             let field_ptr = self.emit_struct_field_ptr(slot, struct_key, index)?;
             build_unit(self.builder.build_store(field_ptr, rendered))?;
         }
+        self.locals.insert(
+            name.to_owned(),
+            Local {
+                pointer: slot,
+                ty: bound_ty.clone(),
+                scalar_ty: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn emit_struct_literal_value(
+        &mut self,
+        struct_key: &str,
+        value: &Expr,
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<Option<BasicValueEnum<'ctx>>> {
+        let struct_ty = self.struct_types.get(struct_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown struct type `{struct_key}`"), source_span)
+        })?;
+        let Expr::StructLiteral { elements, .. } = value else {
+            return Err(Diagnostic::backend_at(
+                "expected struct literal",
+                source_span,
+            ));
+        };
+        let mut aggregate = struct_ty.get_undef();
+        for (index, element) in elements.iter().enumerate() {
+            let rendered = self.emit_expr(element)?;
+            let Some(rendered) = rendered else {
+                return Err(Diagnostic::backend_at(
+                    "cannot initialize struct with void value",
+                    element.span(),
+                ));
+            };
+            aggregate = build_value(self.builder.build_insert_value(
+                aggregate,
+                rendered,
+                index as u32,
+                "struct.val",
+            ))?
+            .into_struct_value();
+        }
+        Ok(Some(aggregate.as_basic_value_enum()))
+    }
+
+    fn emit_struct_from_expr(
+        &mut self,
+        name: &str,
+        struct_key: &str,
+        bound_ty: &TypeName,
+        value: &Expr,
+        source_span: crate::diagnostic::Span,
+    ) -> XResult<()> {
+        let struct_ty = self.struct_types.get(struct_key).ok_or_else(|| {
+            Diagnostic::backend_at(format!("unknown struct type `{struct_key}`"), source_span)
+        })?;
+        let rendered = self.emit_expr(value)?;
+        let Some(rendered) = rendered else {
+            return Err(Diagnostic::backend_at(
+                "cannot bind void value to struct local",
+                source_span,
+            ));
+        };
+        if !rendered.is_struct_value() {
+            return Err(Diagnostic::backend_at(
+                "struct binding requires struct value initializer",
+                source_span,
+            ));
+        }
+        let slot = build_value(self.builder.build_alloca(*struct_ty, name))?;
+        build_unit(self.builder.build_store(slot, rendered))?;
         self.locals.insert(
             name.to_owned(),
             Local {
@@ -1156,6 +1281,15 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                         &format!("{name}.load"),
                     ))?));
                 }
+                if let Some(struct_key) = struct_key_from_type(self.module_name, &local.ty)
+                    && let Some(struct_ty) = self.struct_types.get(&struct_key)
+                {
+                    return Ok(Some(build_value(self.builder.build_load(
+                        *struct_ty,
+                        local.pointer,
+                        &format!("{name}.load"),
+                    ))?));
+                }
                 let Some(scalar_ty) = local.scalar_ty else {
                     if local.ty.array_elem_len().is_some() {
                         return Err(Diagnostic::backend_at(
@@ -1274,10 +1408,18 @@ impl<'emit, 'ctx, 'unit> FunctionEmitter<'emit, 'ctx, 'unit> {
                     "index.load",
                 ))?))
             }
-            Expr::StructLiteral { span, .. } => Err(Diagnostic::backend_at(
-                "struct literals are only supported in struct bindings",
-                *span,
-            )),
+            Expr::StructLiteral { span, .. } => {
+                if let Some(struct_key) =
+                    struct_key_from_type(self.module_name, &self.function_return_type)
+                    && self.struct_types.contains_key(&struct_key)
+                {
+                    return self.emit_struct_literal_value(&struct_key, expr, *span);
+                }
+                Err(Diagnostic::backend_at(
+                    "struct literals require an expected struct type",
+                    *span,
+                ))
+            }
             Expr::FieldAccess {
                 base,
                 field,
@@ -2465,13 +2607,10 @@ fn ensure_backend_signature_type(
             if enum_decl_for_key(unit, &enum_key).is_ok() {
                 Ok(())
             } else if struct_decl_for_key(unit, &struct_ir_name(module_name, name)).is_ok() {
-                Err(Diagnostic::backend_at(
-                    format!("struct type `{name}` is not supported in function signatures yet"),
-                    span,
-                ))
+                Ok(())
             } else {
                 Err(Diagnostic::backend_at(
-                    format!("unknown enum type `{name}`"),
+                    format!("unknown type `{name}`"),
                     span,
                 ))
             }
@@ -2481,15 +2620,10 @@ fn ensure_backend_signature_type(
             if enum_decl_for_key(unit, &enum_key).is_ok() {
                 Ok(())
             } else if struct_decl_for_key(unit, &struct_ir_name(module, name)).is_ok() {
-                Err(Diagnostic::backend_at(
-                    format!(
-                        "struct type `{module}.{name}` is not supported in function signatures yet"
-                    ),
-                    span,
-                ))
+                Ok(())
             } else {
                 Err(Diagnostic::backend_at(
-                    format!("unknown enum type `{module}.{name}`"),
+                    format!("unknown type `{module}.{name}`"),
                     span,
                 ))
             }
@@ -2551,6 +2685,77 @@ fn collect_enum_types_in_signatures(
     }
 }
 
+fn ensure_declared_struct_types_for_signature<'ctx>(
+    context: &'ctx Context,
+    unit: &CompilationUnit,
+    module_name: &str,
+    struct_types: &mut HashMap<String, StructType<'ctx>>,
+    return_type: &TypeName,
+    params: &[TypeName],
+) -> XResult<()> {
+    insert_declared_struct_type(context, unit, module_name, struct_types, return_type)?;
+    for param in params {
+        insert_declared_struct_type(context, unit, module_name, struct_types, param)?;
+    }
+    Ok(())
+}
+
+fn insert_declared_struct_type<'ctx>(
+    context: &'ctx Context,
+    unit: &CompilationUnit,
+    module_name: &str,
+    struct_types: &mut HashMap<String, StructType<'ctx>>,
+    ty: &TypeName,
+) -> XResult<()> {
+    let Some(key) = struct_key_from_type(module_name, ty) else {
+        return Ok(());
+    };
+    if struct_types.contains_key(&key) {
+        return Ok(());
+    }
+    if struct_decl_for_key(unit, &key).is_err() {
+        return Ok(());
+    }
+    let (owner_module, struct_name) = key
+        .split_once('.')
+        .ok_or_else(|| Diagnostic::backend(format!("invalid struct key `{key}`"), 1, 1))?;
+    let owner = unit
+        .modules
+        .get(owner_module)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown module `{owner_module}`"), 1, 1))?;
+    let struct_decl = owner
+        .program
+        .structs
+        .iter()
+        .find(|decl| decl.name == struct_name)
+        .ok_or_else(|| Diagnostic::backend(format!("unknown struct `{key}`"), 1, 1))?;
+    let field_types = struct_decl
+        .fields
+        .iter()
+        .map(|field| llvm_scalar_type(context, &field.ty, field.ty_span))
+        .collect::<XResult<Vec<BasicTypeEnum<'ctx>>>>()?;
+    let struct_type = context
+        .get_struct_type(&key)
+        .unwrap_or_else(|| context.opaque_struct_type(&key));
+    struct_type.set_body(&field_types, false);
+    struct_types.insert(key, struct_type);
+    Ok(())
+}
+
+fn collect_struct_types_in_signatures(
+    unit: &CompilationUnit,
+    program: &Program,
+    module_name: &str,
+    keys: &mut std::collections::HashSet<String>,
+) {
+    for function in &program.functions {
+        insert_struct_key_if_exists(unit, module_name, &function.return_type, keys);
+        for param in &function.params {
+            insert_struct_key_if_exists(unit, module_name, &param.ty, keys);
+        }
+    }
+}
+
 fn llvm_array_type<'ctx>(
     context: &'ctx Context,
     elem: &TypeName,
@@ -2567,6 +2772,7 @@ fn llvm_array_type<'ctx>(
 
 fn llvm_basic_type<'ctx>(
     context: &'ctx Context,
+    struct_types: &HashMap<String, StructType<'ctx>>,
     enum_types: &HashMap<String, StructType<'ctx>>,
     unit: &CompilationUnit,
     module_name: &str,
@@ -2576,18 +2782,29 @@ fn llvm_basic_type<'ctx>(
         TypeName::I32 => Ok(context.i32_type().as_basic_type_enum()),
         TypeName::Bool => Ok(context.bool_type().as_basic_type_enum()),
         TypeName::Named(_) | TypeName::Qualified { .. } => {
-            let key = enum_key_from_type(module_name, ty)
-                .ok_or_else(|| unsupported_backend_type(crate::diagnostic::Span::point(1, 1)))?;
-            enum_types
-                .get(&key)
-                .map(|enum_ty| (*enum_ty).as_basic_type_enum())
-                .ok_or_else(|| {
-                    if enum_decl_for_key(unit, &key).is_ok() {
+            if let Some(key) = enum_key_from_type(module_name, ty)
+                && enum_decl_for_key(unit, &key).is_ok()
+            {
+                return enum_types
+                    .get(&key)
+                    .map(|enum_ty| (*enum_ty).as_basic_type_enum())
+                    .ok_or_else(|| {
                         Diagnostic::backend(format!("missing enum type `{key}`"), 1, 1)
-                    } else {
-                        unsupported_backend_type(crate::diagnostic::Span::point(1, 1))
-                    }
-                })
+                    });
+            }
+            if let Some(key) = struct_key_from_type(module_name, ty)
+                && struct_decl_for_key(unit, &key).is_ok()
+            {
+                return struct_types
+                    .get(&key)
+                    .map(|struct_ty| (*struct_ty).as_basic_type_enum())
+                    .ok_or_else(|| {
+                        Diagnostic::backend(format!("missing struct type `{key}`"), 1, 1)
+                    });
+            }
+            Err(unsupported_backend_type(crate::diagnostic::Span::point(
+                1, 1,
+            )))
         }
         TypeName::Void | TypeName::Str | TypeName::Array { .. } => Err(unsupported_backend_type(
             crate::diagnostic::Span::point(1, 1),

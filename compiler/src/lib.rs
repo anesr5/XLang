@@ -880,7 +880,7 @@ i32 main() {
     }
 
     #[test]
-    fn rejects_named_return_type_at_type_span() {
+    fn rejects_struct_return_type_mismatch_at_return_expr() {
         let source = r#"
 struct Player {
     i32 hp;
@@ -895,9 +895,9 @@ i32 main() {
 }
 "#;
         let err = compile::check_source(source).unwrap_err();
-        assert!(err.message.contains("struct type `Player`"));
-        assert_eq!(err.span.start_line, 6);
-        assert_eq!(err.span.start_column, 1);
+        assert!(err.message.contains("return type mismatch") || err.message.contains("expected"));
+        assert_eq!(err.span.start_line, 7);
+        assert_eq!(err.span.start_column, 12);
     }
 
     #[test]
@@ -1787,6 +1787,14 @@ i32 main() { return 0; }
     }
 
     #[test]
+    fn v0_7_multi_module_struct_abi_example_runs() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/v0.7/main.x");
+        compile::check(&path).unwrap();
+        compile::emit_llvm(&path).unwrap();
+    }
+
+    #[test]
     fn emits_v0_6_cross_module_enum_abi_snapshot() {
         let path = write_module_fixture(
             "cross_module_enum_abi",
@@ -1916,6 +1924,113 @@ pub i32 unwrap(ResultI32 r) {
     }
 
     #[test]
+    fn emits_v0_7_struct_abi_snapshot() {
+        let options = CompileOptions {
+            target_triple: Some("x86_64-unknown-linux-gnu".to_owned()),
+        };
+        let llvm_ir = compile::emit_llvm_source_with_options(
+            r#"
+module main
+
+struct Point {
+    i32 x;
+    i32 y;
+}
+
+Point origin() {
+    Point p = { 3, 4 };
+    return p;
+}
+
+i32 sum(Point p) {
+    return p.x + p.y;
+}
+
+i32 main() {
+    Point p = origin();
+    return sum(p);
+}
+"#,
+            &options,
+        )
+        .unwrap();
+
+        assert!(llvm_ir.contains("%main.Point = type { i32, i32 }"));
+        assert!(llvm_ir.contains("define %main.Point @xlang.main.origin()"));
+        assert!(llvm_ir.contains("%p.load = load %main.Point, ptr %p"));
+        assert!(llvm_ir.contains("ret %main.Point %p.load"));
+        assert!(llvm_ir.contains("define i32 @xlang.main.sum(%main.Point %p)"));
+        assert!(llvm_ir.contains("%p.addr = alloca %main.Point"));
+        assert!(llvm_ir.contains("store %main.Point %p, ptr %p.addr"));
+        assert!(llvm_ir.contains("%calltmp = call %main.Point @xlang.main.origin()"));
+        assert!(llvm_ir.contains("store %main.Point %calltmp, ptr %p"));
+        assert!(llvm_ir.contains("%p.load = load %main.Point, ptr %p"));
+        assert!(llvm_ir.contains("%calltmp1 = call i32 @xlang.main.sum(%main.Point %p.load)"));
+    }
+
+    #[test]
+    fn emits_v0_7_cross_module_struct_abi_snapshot() {
+        let path = write_module_fixture(
+            "cross_module_struct_abi",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import geom
+
+i32 main() {
+    geom.Point p = geom.origin();
+    return geom.sum(p);
+}
+"#,
+                ),
+                (
+                    "geom.x",
+                    r#"
+module geom
+
+pub struct Point {
+    i32 x;
+    i32 y;
+}
+
+pub Point origin() {
+    Point p = { 5, 6 };
+    return p;
+}
+
+pub i32 sum(Point p) {
+    return p.x + p.y;
+}
+"#,
+                ),
+            ],
+        );
+        let checked = compile::check(&path).unwrap();
+        let modules = backend::llvm::emit_compilation_unit(
+            &checked.unit,
+            &backend::llvm::LlvmOptions {
+                target_triple: Some("x86_64-unknown-linux-gnu".to_owned()),
+            },
+        )
+        .unwrap();
+        let main_ir = modules.get("main").expect("main module IR");
+        let geom_ir = modules.get("geom").expect("geom module IR");
+
+        assert!(geom_ir.contains("%geom.Point = type { i32, i32 }"));
+        assert!(geom_ir.contains("define %geom.Point @xlang.geom.origin()"));
+        assert!(geom_ir.contains("define i32 @xlang.geom.sum(%geom.Point %p)"));
+        assert!(main_ir.contains("%geom.Point = type { i32, i32 }"));
+        assert!(main_ir.contains("declare %geom.Point @xlang.geom.origin()"));
+        assert!(main_ir.contains("declare i32 @xlang.geom.sum(%geom.Point)"));
+        assert!(main_ir.contains("%calltmp = call %geom.Point @xlang.geom.origin()"));
+        assert!(main_ir.contains("store %geom.Point %calltmp, ptr %p"));
+        assert!(main_ir.contains("%p.load = load %geom.Point, ptr %p"));
+        assert!(main_ir.contains("%calltmp1 = call i32 @xlang.geom.sum(%geom.Point %p.load)"));
+    }
+
+    #[test]
     fn rejects_private_cross_module_enum_type_name() {
         let path = write_module_fixture(
             "private_enum_type",
@@ -1953,6 +2068,47 @@ pub Hidden make() {
         let err = compile::check(&path).unwrap_err();
         assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
         assert!(err.message.contains("cannot use private enum"));
+    }
+
+    #[test]
+    fn rejects_private_cross_module_struct_type_name() {
+        let path = write_module_fixture(
+            "private_struct_type",
+            &[
+                (
+                    "main.x",
+                    r#"
+module main
+import geom
+
+geom.Point expose() {
+    return geom.origin();
+}
+
+i32 main() { return 0; }
+"#,
+                ),
+                (
+                    "geom.x",
+                    r#"
+module geom
+
+struct Point {
+    i32 x;
+    i32 y;
+}
+
+pub Point origin() {
+    Point p = { 1, 2 };
+    return p;
+}
+"#,
+                ),
+            ],
+        );
+        let err = compile::check(&path).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("cannot use private struct"));
     }
 
     #[test]
@@ -2078,7 +2234,7 @@ i32 main() { return 0; }
     }
 
     #[test]
-    fn rejects_unknown_enum_in_function_signature() {
+    fn rejects_unknown_type_in_function_signature() {
         let source = r#"
 module main
 
@@ -2090,7 +2246,36 @@ i32 main() { return 0; }
 "#;
         let err = compile::check_source(source).unwrap_err();
         assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
-        assert!(err.message.contains("unknown enum type"));
+        assert!(err.message.contains("unknown type"));
+    }
+
+    #[test]
+    fn rejects_struct_parameter_type_mismatch() {
+        let source = r#"
+module main
+
+struct Point {
+    i32 x;
+    i32 y;
+}
+
+struct Size {
+    i32 w;
+    i32 h;
+}
+
+i32 sum(Point p) {
+    return p.x + p.y;
+}
+
+i32 main() {
+    Size s = { 1, 2 };
+    return sum(s);
+}
+"#;
+        let err = compile::check_source(source).unwrap_err();
+        assert_eq!(err.code, diagnostic::DiagnosticCode::Type);
+        assert!(err.message.contains("argument type mismatch"));
     }
 
     #[test]
@@ -2150,25 +2335,31 @@ i32 main() { return 0; }
     }
 
     #[test]
-    fn rejects_struct_in_function_signature() {
+    fn accepts_struct_in_function_signature() {
         let source = r#"
 module main
 
 struct Point {
     i32 x;
+    i32 y;
 }
 
 Point f() {
-    return { 0 };
+    Point p = { 1, 2 };
+    return p;
 }
 
-i32 main() { return 0; }
+i32 sum(Point p) {
+    return p.x + p.y;
+}
+
+i32 main() {
+    Point p = f();
+    return sum(p);
+}
 "#;
-        let err = compile::check_source(source).unwrap_err();
-        assert!(
-            err.message
-                .contains("not supported in function signatures yet")
-        );
+        compile::check_source(source).unwrap();
+        compile::emit_llvm_source(source).unwrap();
     }
 
     #[test]

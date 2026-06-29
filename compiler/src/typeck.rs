@@ -238,13 +238,27 @@ impl<'a> TypeChecker<'a> {
                         struct_ref,
                         annotation_span.unwrap_or(*name_span),
                     )?;
-                    if !matches!(value, Expr::StructLiteral { .. }) {
-                        return Err(Diagnostic::type_error_at(
-                            format!("struct local `{name}` requires a struct literal initializer"),
-                            value.span(),
-                        ));
+                    if matches!(value, Expr::StructLiteral { .. }) {
+                        self.check_struct_literal(struct_ref, value, locals)?;
+                    } else {
+                        let value_ty = self.check_expr(value, locals)?;
+                        if value_ty == TypeName::Void {
+                            return Err(Diagnostic::type_error_at(
+                                format!("cannot bind void value to `{name}`"),
+                                value.span(),
+                            ));
+                        }
+                        if annotation.as_ref() != Some(&value_ty) {
+                            return Err(Diagnostic::type_error_at(
+                                format!(
+                                    "cannot assign {} to {}",
+                                    type_name_display(&value_ty),
+                                    type_name_display(annotation.as_ref().unwrap())
+                                ),
+                                value.span(),
+                            ));
+                        }
                     }
-                    self.check_struct_literal(struct_ref, value, locals)?;
                     annotation.clone().unwrap()
                 } else {
                     if let Some(array_ty) = annotation {
@@ -414,7 +428,9 @@ impl<'a> TypeChecker<'a> {
                 keyword_span,
             } => {
                 let actual = if let Some(expr) = value {
-                    let actual = if expected_return.enum_ref().is_some() {
+                    let actual = if expected_return.enum_ref().is_some()
+                        || expected_return.struct_ref().is_some()
+                    {
                         self.check_expr_for_type(expr, locals, expected_return)?
                     } else {
                         self.check_expr(expr, locals)?
@@ -887,6 +903,13 @@ impl<'a> TypeChecker<'a> {
             self.check_enum_constructor(enum_ref, expr, expr.span(), locals)?;
             return Ok(expected.clone());
         }
+        if let Some(struct_ref) = expected.struct_ref()
+            && self.resolve_struct_layout(struct_ref, expr.span()).is_ok()
+            && matches!(expr, Expr::StructLiteral { .. })
+        {
+            self.check_struct_literal(struct_ref, expr, locals)?;
+            return Ok(expected.clone());
+        }
         let actual = self.check_expr(expr, locals)?;
         if &actual != expected {
             return Err(Diagnostic::type_error_at(
@@ -1131,7 +1154,7 @@ impl<'a> TypeChecker<'a> {
             ));
         }
         for expected in sig.params.iter().chain(std::iter::once(&sig.return_type)) {
-            self.validate_cross_module_signature_enum(module, expected, span)?;
+            self.validate_cross_module_signature_named_type(module, expected, span)?;
         }
         if sig.params.len() != args.len() {
             return Err(Diagnostic::type_error_at(
@@ -1166,29 +1189,35 @@ impl<'a> TypeChecker<'a> {
         Ok(self.qualify_cross_module_type(module, &sig.return_type))
     }
 
-    fn validate_cross_module_signature_enum(
+    fn validate_cross_module_signature_named_type(
         &self,
         owner_module: &str,
         ty: &TypeName,
         span: Span,
     ) -> XResult<()> {
-        let (enum_module, enum_name) = match ty {
+        let (type_module, type_name) = match ty {
             TypeName::Named(name) => (owner_module, name.as_str()),
             TypeName::Qualified { module, name } => (module.as_str(), name.as_str()),
             _ => return Ok(()),
         };
-        if enum_module == self.module_name {
+        if type_module == self.module_name {
             return Ok(());
         }
-        let module_exports = self.exports.get(enum_module).ok_or_else(|| {
-            Diagnostic::type_error_at(format!("unknown module `{enum_module}`"), span)
+        let module_exports = self.exports.get(type_module).ok_or_else(|| {
+            Diagnostic::type_error_at(format!("unknown module `{type_module}`"), span)
         })?;
-        let Some(layout) = module_exports.enums.get(enum_name) else {
-            return Ok(());
-        };
-        if !layout.pub_export {
+        if let Some(layout) = module_exports.enums.get(type_name) {
+            if !layout.pub_export {
+                return Err(Diagnostic::type_error_at(
+                    format!("cannot use private enum `{type_name}` from module `{type_module}`"),
+                    span,
+                ));
+            }
+        } else if let Some(layout) = module_exports.structs.get(type_name)
+            && !layout.pub_export
+        {
             return Err(Diagnostic::type_error_at(
-                format!("cannot use private enum `{enum_name}` from module `{enum_module}`"),
+                format!("cannot use private struct `{type_name}` from module `{type_module}`"),
                 span,
             ));
         }
@@ -1201,12 +1230,9 @@ impl<'a> TypeChecker<'a> {
         }
         match ty {
             TypeName::Named(name) => {
-                if self
-                    .exports
-                    .get(owner_module)
-                    .and_then(|exports| exports.enums.get(name))
-                    .is_some()
-                {
+                if self.exports.get(owner_module).is_some_and(|exports| {
+                    exports.enums.contains_key(name) || exports.structs.contains_key(name)
+                }) {
                     TypeName::Qualified {
                         module: owner_module.to_owned(),
                         name: name.clone(),
@@ -1239,13 +1265,10 @@ impl<'a> TypeChecker<'a> {
                 if self.is_known_enum(EnumRef::Local(name), span) {
                     Ok(())
                 } else if self.structs.contains_key(name) {
-                    Err(Diagnostic::type_error_at(
-                        format!("struct type `{name}` is not supported in function signatures yet"),
-                        span,
-                    ))
+                    Ok(())
                 } else {
                     Err(Diagnostic::type_error_at(
-                        format!("unknown enum type `{name}`"),
+                        format!("unknown type `{name}`"),
                         span,
                     ))
                 }
@@ -1271,15 +1294,11 @@ impl<'a> TypeChecker<'a> {
                     self.resolve_enum_layout(EnumRef::Qualified { module, name }, span)?;
                     Ok(())
                 } else if module_exports.structs.contains_key(name) {
-                    Err(Diagnostic::type_error_at(
-                        format!(
-                            "struct type `{module}.{name}` is not supported in function signatures yet"
-                        ),
-                        span,
-                    ))
+                    self.resolve_struct_layout(StructRef::Qualified { module, name }, span)?;
+                    Ok(())
                 } else {
                     Err(Diagnostic::type_error_at(
-                        format!("unknown enum type `{module}.{name}`"),
+                        format!("unknown type `{module}.{name}`"),
                         span,
                     ))
                 }

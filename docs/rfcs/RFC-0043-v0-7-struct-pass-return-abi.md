@@ -78,9 +78,23 @@ Return lowering:
 ```llvm
 define %main.Point @xlang.main.origin() {
 entry:
-  ret %main.Point { i32 0, i32 0 }
+  %p = alloca %main.Point
+  ...
+  %p.load = load %main.Point, ptr %p
+  ret %main.Point %p.load
 }
 ```
+
+The v0.7 parser keeps positional struct literals tied to typed bindings, so source should return a named value:
+
+```xlang
+Point origin() {
+    Point p = { 0, 0 };
+    return p;
+}
+```
+
+Bare expected-type struct literals such as `return { 0, 0 };` are deferred unless the parser gains expected-type expression context.
 
 Call lowering:
 
